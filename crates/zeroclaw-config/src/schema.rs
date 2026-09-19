@@ -17170,6 +17170,22 @@ pub struct WhatsAppConfig {
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// Allow the `channel_room` tool to create WhatsApp groups and add
+    /// participants through this channel (Web mode only). Default: `false`,
+    /// which rejects both operations before any request reaches WhatsApp.
+    /// Every participant must match an explicit entry in this channel's peer
+    /// allowlist; a `*` entry does not authorize adding anyone to a group.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub room_management: bool,
+    /// When `invite_user` is refused because of the contact's privacy
+    /// settings and WhatsApp returns a single-use invite code, send that
+    /// participant a group invite message in a direct chat (Web mode only).
+    /// Default: `false`. Has no effect unless `room_management` is `true`;
+    /// the participant still has to accept the invite to join.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub room_invite_fallback: bool,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -32347,6 +32363,8 @@ bot_token = "xoxb-tok"
             allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
+            room_management: false,
+            room_invite_fallback: false,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
@@ -32383,6 +32401,8 @@ bot_token = "xoxb-tok"
             allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
+            room_management: false,
+            room_invite_fallback: false,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
@@ -32479,6 +32499,8 @@ allowed_numbers = ["+1", "+2"]
             allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
+            room_management: false,
+            room_invite_fallback: false,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
@@ -32512,6 +32534,8 @@ allowed_numbers = ["+1", "+2"]
             allowed_groups: vec![],
             proxy_url: None,
             approval_timeout_secs: 300,
+            room_management: false,
+            room_invite_fallback: false,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
@@ -32592,6 +32616,8 @@ allowed_numbers = ["+1", "+2"]
                     allowed_groups: vec![],
                     proxy_url: None,
                     approval_timeout_secs: 300,
+                    room_management: false,
+                    room_invite_fallback: false,
                     excluded_tools: vec![],
                     reply_min_interval_secs: 0,
                     reply_queue_depth_max: 0,
