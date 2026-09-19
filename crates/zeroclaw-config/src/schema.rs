@@ -17107,6 +17107,15 @@ pub struct WhatsAppConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub passive_group_context: bool,
+    /// Attach a first-page preview and page count to PDF documents sent over
+    /// WhatsApp Web, so phones show the page on the document card. Rendered
+    /// with `pdftoppm` and `pdfinfo` (poppler-utils) found on `PATH`; the
+    /// larger preview is uploaded next to the document. Default: `false`.
+    /// When the tools are missing, fail, or take too long, the document is
+    /// sent without a preview.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub document_thumbnails: bool,
     /// Cancel an in-flight response from this channel sender when a newer
     /// WhatsApp message arrives. Default: `false`.
     #[serde(default)]
@@ -32337,6 +32346,7 @@ bot_token = "xoxb-tok"
             push_name: None,
             mention_only: false,
             passive_group_context: false,
+            document_thumbnails: false,
             interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
@@ -32373,6 +32383,7 @@ bot_token = "xoxb-tok"
             push_name: None,
             mention_only: false,
             passive_group_context: false,
+            document_thumbnails: false,
             interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
@@ -32469,6 +32480,7 @@ allowed_numbers = ["+1", "+2"]
             push_name: None,
             mention_only: false,
             passive_group_context: false,
+            document_thumbnails: false,
             interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
@@ -32502,6 +32514,7 @@ allowed_numbers = ["+1", "+2"]
             push_name: None,
             mention_only: false,
             passive_group_context: false,
+            document_thumbnails: false,
             interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
@@ -32582,6 +32595,7 @@ allowed_numbers = ["+1", "+2"]
                     push_name: None,
                     mention_only: false,
                     passive_group_context: false,
+                    document_thumbnails: false,
                     interrupt_on_new_message: false,
                     mode: WhatsAppWebMode::default(),
                     dm_policy: WhatsAppChatPolicy::default(),
