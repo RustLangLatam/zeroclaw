@@ -1933,6 +1933,11 @@ impl WhatsAppWebChannel {
 
         let media_type = marker.kind.media_type();
         let mime = marker.kind.mime_for_path(path);
+        let image_preview = if matches!(marker.kind, WhatsAppMediaKind::Image) {
+            image_preview(bytes.clone()).await
+        } else {
+            None
+        };
 
         use whatsapp_rust::upload::UploadOptions;
         let upload = client
@@ -1944,8 +1949,8 @@ impl WhatsAppWebChannel {
         let file_enc_sha256 = upload.file_enc_sha256.to_vec();
         let file_sha256 = upload.file_sha256.to_vec();
         let outgoing = match marker.kind {
-            WhatsAppMediaKind::Image => waproto::whatsapp::Message {
-                image_message: waproto::whatsapp::message::ImageMessage {
+            WhatsAppMediaKind::Image => {
+                let mut image = waproto::whatsapp::message::ImageMessage {
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(media_key),
@@ -1954,10 +1959,15 @@ impl WhatsAppWebChannel {
                     file_length: Some(upload.file_length),
                     mimetype: Some(mime),
                     ..Default::default()
+                };
+                if let Some(preview) = image_preview {
+                    preview.apply_to(&mut image);
                 }
-                .into(),
-                ..Default::default()
-            },
+                waproto::whatsapp::Message {
+                    image_message: image.into(),
+                    ..Default::default()
+                }
+            }
             WhatsAppMediaKind::Video => waproto::whatsapp::Message {
                 video_message: waproto::whatsapp::message::VideoMessage {
                     url: Some(upload.url),
@@ -3642,11 +3652,233 @@ impl Channel for WhatsAppWebChannel {
     }
 }
 
+/// Longest side of the inline JPEG on an outgoing image. Phones draw the
+/// image card from it until the full image is downloaded, and they do not
+/// download automatically from senders outside the contact list, so without
+/// it the card stays empty. The official apps send about this size.
+#[cfg(feature = "whatsapp-web")]
+const IMAGE_PREVIEW_SIDE: u32 = 100;
+
+#[cfg(feature = "whatsapp-web")]
+const IMAGE_PREVIEW_JPEG_QUALITY: u8 = 60;
+
+/// The inline JPEG travels in the message itself.
+#[cfg(feature = "whatsapp-web")]
+const IMAGE_PREVIEW_MAX_BYTES: usize = 16 * 1024;
+
+/// Decoding limits for the image being previewed, which may be a file the
+/// agent downloaded. Anything larger is sent without a preview.
+#[cfg(feature = "whatsapp-web")]
+const IMAGE_PREVIEW_MAX_SOURCE_SIDE: u32 = 12_000;
+
+#[cfg(feature = "whatsapp-web")]
+const IMAGE_PREVIEW_MAX_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// Size and inline preview for an outgoing image card.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, PartialEq, Eq)]
+struct ImagePreview {
+    width: u32,
+    height: u32,
+    jpeg: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl ImagePreview {
+    fn apply_to(self, image: &mut waproto::whatsapp::message::ImageMessage) {
+        image.width = Some(self.width);
+        image.height = Some(self.height);
+        if let Some(jpeg) = self.jpeg {
+            image.jpeg_thumbnail = Some(jpeg);
+        }
+    }
+}
+
+/// Best-effort preview for the image in `bytes`: `None`, with a warning,
+/// when it cannot be decoded within the limits.
+#[cfg(feature = "whatsapp-web")]
+async fn image_preview(bytes: Vec<u8>) -> Option<ImagePreview> {
+    let rendered = tokio::task::spawn_blocking(move || {
+        render_image_preview(&bytes, IMAGE_PREVIEW_MAX_SOURCE_SIDE)
+    })
+    .await
+    .unwrap_or_else(|_| Err("preview task did not finish".to_string()));
+    match rendered {
+        Ok(preview) => {
+            if preview.jpeg.is_none() {
+                note_image_preview_skipped("rendered preview exceeds the inline size cap");
+            }
+            Some(preview)
+        }
+        Err(reason) => {
+            note_image_preview_skipped(&reason);
+            None
+        }
+    }
+}
+
+/// Decode `bytes`, apply the EXIF orientation so the preview matches what
+/// the recipient sees, and scale it into an inline JPEG. The reported size is
+/// that of the oriented full image.
+#[cfg(feature = "whatsapp-web")]
+fn render_image_preview(
+    bytes: &[u8],
+    max_source_side: u32,
+) -> std::result::Result<ImagePreview, String> {
+    use image::ImageDecoder as _;
+
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("could not read image: {e}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_source_side);
+    limits.max_image_height = Some(max_source_side);
+    limits.max_alloc = Some(IMAGE_PREVIEW_MAX_ALLOC);
+    reader.limits(limits);
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| format!("could not decode image: {e}"))?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut full = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("could not decode image: {e}"))?;
+    full.apply_orientation(orientation);
+
+    let thumbnail = full
+        .thumbnail(IMAGE_PREVIEW_SIDE, IMAGE_PREVIEW_SIDE)
+        .to_rgb8();
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, IMAGE_PREVIEW_JPEG_QUALITY)
+        .encode_image(&thumbnail)
+        .map_err(|e| format!("could not encode preview: {e}"))?;
+    Ok(ImagePreview {
+        width: full.width(),
+        height: full.height(),
+        jpeg: (jpeg.len() <= IMAGE_PREVIEW_MAX_BYTES).then_some(jpeg),
+    })
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn note_image_preview_skipped(reason: &str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "reason": reason })),
+        "whatsapp-web: image preview skipped"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+
+    // ── Outgoing image previews ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn encoded_image(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(width, height, image::Rgb([200, 40, 60]))
+            .write_to(&mut bytes, format)
+            .expect("encode test image");
+        bytes.into_inner()
+    }
+
+    /// A JPEG whose EXIF block says "rotate 90° clockwise to display"
+    /// (orientation 6), as phone cameras write for portrait shots.
+    #[cfg(feature = "whatsapp-web")]
+    fn rotated_jpeg(stored_width: u32, stored_height: u32) -> Vec<u8> {
+        let jpeg = encoded_image(stored_width, stored_height, image::ImageFormat::Jpeg);
+        let mut exif = b"Exif\0\0II*\0".to_vec();
+        exif.extend_from_slice(&8u32.to_le_bytes());
+        exif.extend_from_slice(&1u16.to_le_bytes());
+        exif.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        exif.extend_from_slice(&6u32.to_le_bytes());
+        exif.extend_from_slice(&0u32.to_le_bytes());
+        let length = u16::try_from(exif.len() + 2).expect("short segment");
+        let mut out = jpeg[..2].to_vec();
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&exif);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn image_preview_reports_the_full_size_and_a_small_inline_jpeg() {
+        let png = encoded_image(1400, 1981, image::ImageFormat::Png);
+        let preview = render_image_preview(&png, IMAGE_PREVIEW_MAX_SOURCE_SIDE).expect("renders");
+        assert_eq!((preview.width, preview.height), (1400, 1981));
+        let jpeg = preview.jpeg.expect("inline preview");
+        assert!(
+            jpeg.starts_with(&[0xFF, 0xD8]),
+            "the inline preview is a JPEG"
+        );
+        let thumbnail = image::load_from_memory(&jpeg).expect("decodes");
+        assert_eq!(
+            thumbnail.height(),
+            100,
+            "phones only draw an inline preview about the size the official apps send"
+        );
+        assert!(
+            thumbnail.width() < thumbnail.height(),
+            "keeps the aspect ratio"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn image_preview_follows_the_exif_orientation() {
+        let preview = render_image_preview(&rotated_jpeg(40, 20), IMAGE_PREVIEW_MAX_SOURCE_SIDE)
+            .expect("renders");
+        assert_eq!(
+            (preview.width, preview.height),
+            (20, 40),
+            "a portrait photo stored sideways is reported as portrait"
+        );
+        let thumbnail =
+            image::load_from_memory(&preview.jpeg.expect("inline preview")).expect("decodes");
+        assert!(thumbnail.width() < thumbnail.height());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn image_preview_fails_on_unreadable_or_oversized_input() {
+        assert!(render_image_preview(b"not an image", IMAGE_PREVIEW_MAX_SOURCE_SIDE).is_err());
+        let png = encoded_image(40, 40, image::ImageFormat::Png);
+        assert!(
+            render_image_preview(&png, 20).is_err(),
+            "images over the decoding limit get no preview"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn image_preview_fills_the_image_card_fields() {
+        let mut image = waproto::whatsapp::message::ImageMessage::default();
+        ImagePreview {
+            width: 1400,
+            height: 1981,
+            jpeg: Some(vec![0xFF, 0xD8, 0xFF]),
+        }
+        .apply_to(&mut image);
+        assert_eq!((image.width, image.height), (Some(1400), Some(1981)));
+        assert_eq!(image.jpeg_thumbnail, Some(vec![0xFF, 0xD8, 0xFF]));
+
+        let mut size_only = waproto::whatsapp::message::ImageMessage::default();
+        ImagePreview {
+            width: 10,
+            height: 20,
+            jpeg: None,
+        }
+        .apply_to(&mut size_only);
+        assert_eq!((size_only.width, size_only.height), (Some(10), Some(20)));
+        assert_eq!(size_only.jpeg_thumbnail, None);
+    }
 
     /// Wrap one message in the single-entry batch that 0.7 delivers for live
     /// traffic, so tests keep expressing "one inbound message" directly.
