@@ -1836,6 +1836,8 @@ impl WhatsAppWebChannel {
             }
         };
 
+        let (addressed, target_chat) = vote_delivery(target.vote_reply, reply_target, sender);
+
         for option in poll_option_names(&target.options, &selected) {
             if let Err(e) = context
                 .tx
@@ -1845,7 +1847,7 @@ impl WhatsAppWebChannel {
                     channel_alias: Some(context.alias.to_string()),
                     sender: sender.to_string(),
                     platform_sender_id: None,
-                    reply_target: reply_target.to_string(),
+                    reply_target: target_chat.clone(),
                     content: format!("[choice]{option}"),
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     thread_ts: None,
@@ -1853,16 +1855,20 @@ impl WhatsAppWebChannel {
                     attachments: Vec::new(),
                     subject: None,
                     internal_sop_event: None,
-                    // A vote is an ordinary inbound message, the way Signal
-                    // reports one. Marking it as addressed would start a turn
-                    // per vote, so a poll in a busy group would have the agent
-                    // answering every voter in public.
-                    passive_context: context.passive_group_context && info.source.is_group,
-                    explicitly_addressed: false,
-                    conversation_scope: Self::group_context_scope(
-                        context.passive_group_context,
-                        info.source.is_group,
-                    ),
+                    // A vote that nobody asked the agent to answer is an
+                    // ordinary inbound message, the way Signal reports one.
+                    passive_context: !addressed
+                        && context.passive_group_context
+                        && info.source.is_group,
+                    explicitly_addressed: addressed,
+                    conversation_scope: if addressed {
+                        ChannelConversationScope::Sender
+                    } else {
+                        Self::group_context_scope(
+                            context.passive_group_context,
+                            info.source.is_group,
+                        )
+                    },
                     // A vote is not spoken input.
                     voice_origin: false,
                     references: Vec::new(),
@@ -3845,6 +3851,7 @@ impl Channel for WhatsAppWebChannel {
             PollTarget {
                 secret,
                 options: poll.options.clone(),
+                vote_reply: poll.vote_reply,
                 recorded_at: std::time::Instant::now(),
             },
         );
@@ -4285,6 +4292,8 @@ const POLL_TARGET_CAPACITY: usize = 256;
 struct PollTarget {
     secret: Vec<u8>,
     options: Vec<String>,
+    /// What this poll's votes should do when they arrive.
+    vote_reply: zeroclaw_api::channel::PollVoteReply,
     recorded_at: std::time::Instant,
 }
 
@@ -4323,6 +4332,26 @@ fn lookup_poll_target(targets: &PollTargets, message_id: &str) -> Option<PollTar
         return None;
     }
     Some(target)
+}
+
+/// Whether a vote should start a turn, and where the answer goes.
+///
+/// The poll decided this when it was posted: stay out of the way, open a turn
+/// in the chat it was posted in, or take the voter aside. One chat can carry
+/// both kinds - a list of wines on offer that answers each buyer, and a poll
+/// that only gathers opinions - which is why this travels per poll.
+#[cfg(feature = "whatsapp-web")]
+fn vote_delivery(
+    vote_reply: zeroclaw_api::channel::PollVoteReply,
+    poll_chat: &str,
+    voter: &str,
+) -> (bool, String) {
+    use zeroclaw_api::channel::PollVoteReply;
+    match vote_reply {
+        PollVoteReply::Ignore => (false, poll_chat.to_string()),
+        PollVoteReply::InChat => (true, poll_chat.to_string()),
+        PollVoteReply::Direct => (true, voter.to_string()),
+    }
 }
 
 /// This device's own JID in the namespace a vote was authored under.
@@ -4512,6 +4541,7 @@ mod tests {
         PollTarget {
             secret: vec![7u8; 32],
             options: options.iter().map(|o| (*o).to_string()).collect(),
+            vote_reply: zeroclaw_api::channel::PollVoteReply::Ignore,
             recorded_at: std::time::Instant::now(),
         }
     }
@@ -4569,6 +4599,30 @@ mod tests {
         assert!(
             lookup_poll_target(&targets, &format!("POLL{}", POLL_TARGET_CAPACITY + 4)).is_some(),
             "the newest poll is kept"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_polls_own_setting_decides_what_its_votes_do() {
+        use zeroclaw_api::channel::PollVoteReply;
+        let group = "120363000000000001@g.us";
+        let voter = "+15550001111";
+
+        assert_eq!(
+            vote_delivery(PollVoteReply::Ignore, group, voter),
+            (false, group.to_string()),
+            "an opinion poll records votes without starting a turn"
+        );
+        assert_eq!(
+            vote_delivery(PollVoteReply::InChat, group, voter),
+            (true, group.to_string()),
+            "a poll that answers its voters replies where it was posted"
+        );
+        assert_eq!(
+            vote_delivery(PollVoteReply::Direct, group, voter),
+            (true, voter.to_string()),
+            "taking the voter aside answers them, not the group"
         );
     }
 
