@@ -12090,7 +12090,44 @@ pub fn build_channel_map(
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
     let configured = collect_configured_channels(&config_arc, "", &[], None, None);
-    configured_channel_map(&configured)
+    prefer_live_channels(
+        configured_channel_map(&configured),
+        live_channel_registry().as_ref(),
+    )
+}
+
+/// Replace freshly built channels with the running instances, and add the ones
+/// this surface cannot construct at all.
+///
+/// A channel built from config here has never been through `listen()`. For a
+/// stateless channel that is invisible: it sends over HTTP with the configured
+/// token. For a session-bound one it is fatal - `WhatsAppWebChannel` only holds
+/// its client after pairing, so a fresh instance reports "not connected" while
+/// the real channel is serving traffic. The running task publishes its
+/// instances in [`CRON_CHANNEL_REGISTRY`], so prefer those, exactly as
+/// `deliver_announcement` already does.
+///
+/// Live-only keys are kept as well: plugin channels are constructed
+/// asynchronously and so never appear in the synchronous map, which is why
+/// channel-addressed tools could not target them.
+fn prefer_live_channels(
+    mut built: HashMap<String, Arc<dyn Channel>>,
+    live: Option<&CronChannelRegistry>,
+) -> HashMap<String, Arc<dyn Channel>> {
+    if let Some(live) = live {
+        for (key, channel) in live.iter() {
+            built.insert(key.clone(), Arc::clone(channel));
+        }
+    }
+    built
+}
+
+/// The instances the running channel task published, if one is running.
+fn live_channel_registry() -> Option<CronChannelRegistry> {
+    CRON_CHANNEL_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 pub fn register_channels_for_tools(
@@ -12112,7 +12149,10 @@ pub fn register_channels_for_tools(
         escalate_handle.as_ref(),
     ];
 
-    let map = configured_channel_map(&configured);
+    let map = prefer_live_channels(
+        configured_channel_map(&configured),
+        live_channel_registry().as_ref(),
+    );
     for (key, channel) in &map {
         for handle in handles.iter().flatten() {
             handle.write().insert(key.clone(), Arc::clone(channel));
@@ -17273,6 +17313,75 @@ temperature = 0.3
             !map.contains_key("discord"),
             "bare key would be ambiguous for multiple aliases"
         );
+    }
+
+    #[test]
+    fn prefer_live_channels_swaps_in_the_running_instance() {
+        // The built instance has never been through `listen()`; the running
+        // one holds the session. Same key, so the running one has to win.
+        let built_whatsapp = mock_channel("whatsapp");
+        let live_whatsapp = mock_channel("whatsapp");
+        let built = HashMap::from([(
+            "whatsapp.ventas".to_string(),
+            Arc::clone(&built_whatsapp) as Arc<dyn Channel>,
+        )]);
+        let live: CronChannelRegistry = Arc::new(HashMap::from([(
+            "whatsapp.ventas".to_string(),
+            Arc::clone(&live_whatsapp) as Arc<dyn Channel>,
+        )]));
+
+        let merged = prefer_live_channels(built, Some(&live));
+
+        assert!(Arc::ptr_eq(
+            merged.get("whatsapp.ventas").unwrap(),
+            &(Arc::clone(&live_whatsapp) as Arc<dyn Channel>)
+        ));
+    }
+
+    #[test]
+    fn prefer_live_channels_keeps_channels_only_one_side_knows() {
+        // Plugin channels are built asynchronously, so they exist only in the
+        // live registry; a configured channel that is not running exists only
+        // in the built map. Both stay reachable.
+        let built_only = mock_channel("telegram");
+        let live_only = mock_channel("plugin");
+        let built = HashMap::from([(
+            "telegram.work".to_string(),
+            Arc::clone(&built_only) as Arc<dyn Channel>,
+        )]);
+        let live: CronChannelRegistry = Arc::new(HashMap::from([(
+            "plugin.acme".to_string(),
+            Arc::clone(&live_only) as Arc<dyn Channel>,
+        )]));
+
+        let merged = prefer_live_channels(built, Some(&live));
+
+        assert_eq!(merged.len(), 2);
+        assert!(Arc::ptr_eq(
+            merged.get("telegram.work").unwrap(),
+            &(Arc::clone(&built_only) as Arc<dyn Channel>)
+        ));
+        assert!(Arc::ptr_eq(
+            merged.get("plugin.acme").unwrap(),
+            &(Arc::clone(&live_only) as Arc<dyn Channel>)
+        ));
+    }
+
+    #[test]
+    fn prefer_live_channels_without_a_running_task_returns_what_was_built() {
+        let built_only = mock_channel("telegram");
+        let built = HashMap::from([(
+            "telegram.work".to_string(),
+            Arc::clone(&built_only) as Arc<dyn Channel>,
+        )]);
+
+        let merged = prefer_live_channels(built, None);
+
+        assert_eq!(merged.len(), 1);
+        assert!(Arc::ptr_eq(
+            merged.get("telegram.work").unwrap(),
+            &(Arc::clone(&built_only) as Arc<dyn Channel>)
+        ));
     }
 
     struct CronChannelRegistryRestore(Option<CronChannelRegistry>);
