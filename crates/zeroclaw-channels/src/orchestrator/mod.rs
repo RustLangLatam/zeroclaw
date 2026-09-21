@@ -12116,7 +12116,15 @@ fn prefer_live_channels(
 ) -> HashMap<String, Arc<dyn Channel>> {
     if let Some(live) = live {
         for (key, channel) in live.iter() {
-            built.insert(key.clone(), Arc::clone(channel));
+            // A live entry replaces what this surface built for the same key,
+            // but only a plugin channel may add a key of its own: those are
+            // the ones config cannot build. Anything else the caller did not
+            // just build is a retired generation - a disabled alias whose task
+            // has not finished tearing down - and must not come back to life
+            // for a dashboard session that outlived it.
+            if built.contains_key(key) || key.starts_with("plugin.") {
+                built.insert(key.clone(), Arc::clone(channel));
+            }
         }
     }
     built
@@ -17336,6 +17344,25 @@ temperature = 0.3
             merged.get("whatsapp.ventas").unwrap(),
             &(Arc::clone(&live_whatsapp) as Arc<dyn Channel>)
         ));
+    }
+
+    #[test]
+    fn prefer_live_channels_does_not_resurrect_a_retired_alias() {
+        // A dashboard session seeded after an alias was disabled must not get
+        // that alias back from a registry generation still tearing down.
+        let retired = mock_channel("telegram");
+        let built = HashMap::new();
+        let live: CronChannelRegistry = Arc::new(HashMap::from([(
+            "telegram.retired".to_string(),
+            Arc::clone(&retired) as Arc<dyn Channel>,
+        )]));
+
+        let merged = prefer_live_channels(built, Some(&live));
+
+        assert!(
+            merged.is_empty(),
+            "a key config no longer builds stays gone"
+        );
     }
 
     #[test]
