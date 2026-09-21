@@ -133,6 +133,12 @@ invite card in a direct chat, the same card the WhatsApp apps send. It still
 returns an error saying the participant was not added and an invite was sent:
 they join only if they accept it, and the agent should not retry.
 
+Turning this on means the channel can send an **unsolicited direct message** to
+that participant: an invite card in a chat they did not start. It only reaches
+someone the operator both allowlisted and named in an `invite_user` call, and
+only for the privacy refusal above, but it is a message the person did not ask
+for. Leave it off unless that is wanted.
+
 ```toml
 [channels.whatsapp.myaccount]
 room_management = true

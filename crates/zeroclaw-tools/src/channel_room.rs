@@ -180,10 +180,12 @@ impl ChannelRoomTool {
         if !channel.room_management_requires_approval() {
             return Ok(());
         }
+        // `always_ask = ["*"]` is a valid policy that already prompts for every
+        // tool at the runtime gate, so it satisfies this too.
         if security
             .always_ask
             .iter()
-            .any(|tool| tool.trim() == "channel_room")
+            .any(|tool| matches!(tool.trim(), "channel_room" | "*"))
         {
             return Ok(());
         }
@@ -506,6 +508,30 @@ mod tests {
         let tool = tool_with_policy(
             SecurityPolicy {
                 always_ask: vec!["channel_room".to_string()],
+                ..SecurityPolicy::default()
+            },
+            channel.clone(),
+        );
+
+        let result = tool
+            .execute(json!({
+                "action": "create_room",
+                "channel": "matrix",
+                "name": "ops",
+            }))
+            .await
+            .expect("tool runs");
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(channel.created.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_always_ask_satisfies_the_gate() {
+        let channel = Arc::new(MockChannel::demanding_approval());
+        let tool = tool_with_policy(
+            SecurityPolicy {
+                always_ask: vec!["*".to_string()],
                 ..SecurityPolicy::default()
             },
             channel.clone(),
