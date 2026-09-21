@@ -3699,7 +3699,11 @@ impl ImagePreview {
 #[cfg(feature = "whatsapp-web")]
 async fn image_preview(bytes: Vec<u8>) -> Option<ImagePreview> {
     let rendered = tokio::task::spawn_blocking(move || {
-        render_image_preview(&bytes, IMAGE_PREVIEW_MAX_SOURCE_SIDE)
+        render_image_preview(
+            &bytes,
+            IMAGE_PREVIEW_MAX_SOURCE_SIDE,
+            IMAGE_PREVIEW_MAX_ALLOC,
+        )
     })
     .await
     .unwrap_or_else(|_| Err("preview task did not finish".to_string()));
@@ -3724,6 +3728,7 @@ async fn image_preview(bytes: Vec<u8>) -> Option<ImagePreview> {
 fn render_image_preview(
     bytes: &[u8],
     max_source_side: u32,
+    max_alloc: u64,
 ) -> std::result::Result<ImagePreview, String> {
     use image::ImageDecoder as _;
 
@@ -3733,11 +3738,21 @@ fn render_image_preview(
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(max_source_side);
     limits.max_image_height = Some(max_source_side);
-    limits.max_alloc = Some(IMAGE_PREVIEW_MAX_ALLOC);
+    limits.max_alloc = Some(max_alloc);
     reader.limits(limits);
     let mut decoder = reader
         .into_decoder()
         .map_err(|e| format!("could not decode image: {e}"))?;
+    // `into_decoder` + `from_decoder` skips the reservation `ImageReader::decode`
+    // makes, and the JPEG decoder enforces dimensions but not `max_alloc`, so a
+    // small file within the side limits could still ask for a buffer past the
+    // budget. Check it before anything is allocated.
+    let needed = decoder.total_bytes();
+    if needed > max_alloc {
+        return Err(format!(
+            "decoded image needs {needed} bytes, over the {max_alloc} byte budget"
+        ));
+    }
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
@@ -3811,7 +3826,9 @@ mod tests {
     #[cfg(feature = "whatsapp-web")]
     fn image_preview_reports_the_full_size_and_a_small_inline_jpeg() {
         let png = encoded_image(1400, 1981, image::ImageFormat::Png);
-        let preview = render_image_preview(&png, IMAGE_PREVIEW_MAX_SOURCE_SIDE).expect("renders");
+        let preview =
+            render_image_preview(&png, IMAGE_PREVIEW_MAX_SOURCE_SIDE, IMAGE_PREVIEW_MAX_ALLOC)
+                .expect("renders");
         assert_eq!((preview.width, preview.height), (1400, 1981));
         let jpeg = preview.jpeg.expect("inline preview");
         assert!(
@@ -3833,8 +3850,12 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn image_preview_follows_the_exif_orientation() {
-        let preview = render_image_preview(&rotated_jpeg(40, 20), IMAGE_PREVIEW_MAX_SOURCE_SIDE)
-            .expect("renders");
+        let preview = render_image_preview(
+            &rotated_jpeg(40, 20),
+            IMAGE_PREVIEW_MAX_SOURCE_SIDE,
+            IMAGE_PREVIEW_MAX_ALLOC,
+        )
+        .expect("renders");
         assert_eq!(
             (preview.width, preview.height),
             (20, 40),
@@ -3848,11 +3869,38 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn image_preview_fails_on_unreadable_or_oversized_input() {
-        assert!(render_image_preview(b"not an image", IMAGE_PREVIEW_MAX_SOURCE_SIDE).is_err());
+        assert!(
+            render_image_preview(
+                b"not an image",
+                IMAGE_PREVIEW_MAX_SOURCE_SIDE,
+                IMAGE_PREVIEW_MAX_ALLOC
+            )
+            .is_err()
+        );
         let png = encoded_image(40, 40, image::ImageFormat::Png);
         assert!(
-            render_image_preview(&png, 20).is_err(),
+            render_image_preview(&png, 20, IMAGE_PREVIEW_MAX_ALLOC).is_err(),
             "images over the decoding limit get no preview"
+        );
+    }
+
+    /// The side limits let a small file through whose decoded buffer is huge:
+    /// a 10000x10000 RGB JPEG is inside 12000 px per side but needs 300 MB.
+    /// The decoder enforces dimensions, not the allocation budget, so the
+    /// budget has to be checked before the buffer is asked for.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn image_preview_refuses_a_decode_that_would_blow_the_allocation_budget() {
+        let png = encoded_image(200, 200, image::ImageFormat::Png);
+        let needed = 200u64 * 200 * 3;
+
+        let error = render_image_preview(&png, IMAGE_PREVIEW_MAX_SOURCE_SIDE, needed - 1)
+            .expect_err("a decode over the budget is refused");
+        assert!(error.contains("budget"), "{error}");
+
+        assert!(
+            render_image_preview(&png, IMAGE_PREVIEW_MAX_SOURCE_SIDE, needed).is_ok(),
+            "the same image renders when the budget covers it"
         );
     }
 
