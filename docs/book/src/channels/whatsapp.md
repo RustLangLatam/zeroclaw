@@ -156,6 +156,12 @@ adding `channel_room` to `always_ask` in the agent's risk profile (see
 [Autonomy](../security/autonomy.md)) so each call waits for an operator reply,
 as described in the next section.
 
+That approval is **required**, not advisory: with `room_management = true` but
+`channel_room` missing from `always_ask`, the tool refuses and says so. Creating
+a group and adding people to it is visible to everyone in it and cannot be undone
+from here, so it is not something the model does unattended. `always_ask` holds
+even under Full autonomy.
+
 ## Tool approval over chat (`approval_timeout_secs`)
 
 When a tool needs approval (it is in `always_ask`, or the risk profile does not

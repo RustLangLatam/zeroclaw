@@ -3646,6 +3646,13 @@ impl Channel for WhatsAppWebChannel {
         Ok(())
     }
 
+    /// Creating a WhatsApp group and adding people to it is visible to every
+    /// participant and cannot be undone from here, so this channel refuses to
+    /// do either unless an operator approves the call.
+    fn room_management_requires_approval(&self) -> bool {
+        true
+    }
+
     async fn create_room(&self, options: &RoomCreationOptions) -> Result<String> {
         self.ensure_room_management_enabled()?;
         let request = self.group_create_options(options)?;

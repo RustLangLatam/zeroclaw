@@ -497,6 +497,12 @@ impl Channel for PacedChannel {
         self.inner.invite_user(room_id, user_id).await
     }
 
+    /// Forwarded: without this the wrapper would report that the inner
+    /// channel needs no approval to create groups.
+    fn room_management_requires_approval(&self) -> bool {
+        self.inner.room_management_requires_approval()
+    }
+
     /// Must be forwarded explicitly: the trait default returns `None`, so
     /// without this every channel wrapped here would report that it supplies no
     /// room context, no matter what the inner channel knows. Pacing concerns
