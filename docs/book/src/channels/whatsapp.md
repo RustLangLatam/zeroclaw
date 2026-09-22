@@ -207,11 +207,10 @@ Three things shape the voice note itself:
 
 ### What does not apply here
 
-The peer-group `output_modality` setting does not govern this channel. It is
-read for Matrix and Telegram, where a group can be declared `voice`, `text` or
-`mirror`; on WhatsApp the decision is the per-chat rule above. Setting
-`output_modality = "text"` on a peer group whose channel is WhatsApp changes
-nothing, in either direction.
+The peer-group `output_modality` setting does not drive the automatic voice
+reply. It is read for Matrix and Telegram, where a group can be declared
+`voice`, `text` or `mirror`; on WhatsApp what decides is the per-chat rule
+above, and declaring a peer group `text` does not switch it off.
 
 ## Configuration surfaces
 
