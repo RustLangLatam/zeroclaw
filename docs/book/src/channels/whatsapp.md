@@ -151,6 +151,68 @@ different chat. Until that path is hardened, a Cloud-mode approval is proof
 that someone possessed the token and nothing more. It authenticates neither the
 chat nor the responder, so prefer Web mode wherever either matters.
 
+## Voice notes
+
+In Web mode the channel reads voice notes and can answer with one. Both halves
+are off until they are configured, and each is configured separately.
+
+### Reading them
+
+A voice note is transcribed when `[transcription]` is enabled and a
+transcription provider is configured. One provider is enough on its own: it is
+bound without any per-agent setting. With several configured, the owning
+agent's `transcription_provider` chooses between them, and an agent that names
+none leaves the choice unbound rather than routing audio to whichever vendor
+came first, so the note arrives untranscribed and the reason is logged.
+
+The transcript reaches the agent as the message content, prefixed `[Voice] `,
+so a spoken message and a typed one are told apart in the history without a
+second field.
+
+- A note longer than `transcription.max_duration_secs` is skipped, and so is
+  one whose download or transcription fails, or whose transcript comes back
+  empty. The message then carries the ordinary media placeholder instead, and
+  the failure is logged.
+- Only voice notes are read. Other audio, such as a forwarded clip or a music
+  file, is ignored unless `transcription.transcribe_non_ptt_audio = true`.
+
+### Answering with one
+
+Speaking a reply needs `tts.enabled` and a `tts_provider` on the owning agent.
+An agent with no provider named stays silent rather than picking one, and says
+so in the log.
+
+**A chat is answered by voice when the last message it received was a voice
+note.** The state is per chat, not per sender, and any later message that is
+not a voice note clears it, so a conversation drops back to text as soon as
+someone types. In a group that means whoever spoke last decides, and the spoken
+reply is audible to the whole group.
+
+When the reply is spoken, the chat gets **both**: the text as usual, and a
+voice note alongside it. The chat keeps a readable record, and nothing is only
+available as audio.
+
+Three things shape the voice note itself:
+
+- It is sent as a real voice note (`ptt`), Opus-encoded, not as an audio
+  attachment, so it renders as the waveform bubble rather than a file card.
+- One reply is spoken per voice note received. The channel waits about ten
+  seconds after the last message before synthesizing, so an agent that answers
+  in several parts, or runs a chain of tools first, produces a single voice
+  note carrying the final answer rather than one per fragment.
+- Replies that do not read well aloud stay text-only: anything under 40 bytes,
+  or that begins with a URL, a JSON document, a bracketed marker or `Error`, or
+  that carries a code fence, tool-call markup or raw weather-tool output. These
+  are shapes, not settings; a reply is judged by what it looks like.
+
+### What does not apply here
+
+The peer-group `output_modality` setting does not govern this channel. It is
+read for Matrix and Telegram, where a group can be declared `voice`, `text` or
+`mirror`; on WhatsApp the decision is the per-chat rule above. Setting
+`output_modality = "text"` on a peer group whose channel is WhatsApp changes
+nothing, in either direction.
+
 ## Configuration surfaces
 
 {{#config-fields channels.whatsapp}}
