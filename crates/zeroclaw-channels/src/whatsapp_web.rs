@@ -1836,43 +1836,19 @@ impl WhatsAppWebChannel {
             }
         };
 
-        let (addressed, target_chat) = vote_delivery(target.vote_reply, reply_target, sender);
-
         for option in poll_option_names(&target.options, &selected) {
             if let Err(e) = context
                 .tx
-                .send(ChannelMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    channel: "whatsapp".to_string(),
-                    channel_alias: Some(context.alias.to_string()),
-                    sender: sender.to_string(),
-                    platform_sender_id: None,
-                    reply_target: target_chat.clone(),
-                    content: format!("[choice]{option}"),
-                    timestamp: chrono::Utc::now().timestamp() as u64,
-                    thread_ts: None,
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
-                    subject: None,
-                    internal_sop_event: None,
-                    // A vote that nobody asked the agent to answer is an
-                    // ordinary inbound message, the way Signal reports one.
-                    passive_context: !addressed
-                        && context.passive_group_context
-                        && info.source.is_group,
-                    explicitly_addressed: addressed,
-                    conversation_scope: if addressed {
-                        ChannelConversationScope::Sender
-                    } else {
-                        Self::group_context_scope(
-                            context.passive_group_context,
-                            info.source.is_group,
-                        )
-                    },
-                    // A vote is not spoken input.
-                    voice_origin: false,
-                    references: Vec::new(),
-                })
+                .send(vote_message(
+                    &context.alias,
+                    sender,
+                    voter,
+                    reply_target,
+                    &option,
+                    target.vote_reply,
+                    context.passive_group_context,
+                    info.source.is_group,
+                ))
                 .await
             {
                 ::zeroclaw_log::record!(
@@ -4334,23 +4310,62 @@ fn lookup_poll_target(targets: &PollTargets, message_id: &str) -> Option<PollTar
     Some(target)
 }
 
-/// Whether a vote should start a turn, and where the answer goes.
+/// The inbound message one selected option becomes.
 ///
-/// The poll decided this when it was posted: stay out of the way, open a turn
-/// in the chat it was posted in, or take the voter aside. One chat can carry
-/// both kinds - a list of wines on offer that answers each buyer, and a poll
-/// that only gathers opinions - which is why this travels per poll.
+/// The poll decided when it was posted what its votes do: stay out of the way,
+/// open a turn in the chat it was posted in, or take the voter aside. One chat
+/// can carry both kinds - a list of wines on offer that answers each buyer, and
+/// a poll that only gathers opinions - which is why this travels per poll.
+///
+/// Taking the voter aside answers their own chat, addressed by the JID the
+/// vote was authored under. That is the address an ordinary direct message
+/// from them carries too, so the private answer and their next message share
+/// one conversation, and a voter WhatsApp addresses by LID keeps their LID.
 #[cfg(feature = "whatsapp-web")]
-fn vote_delivery(
-    vote_reply: zeroclaw_api::channel::PollVoteReply,
+fn vote_message(
+    alias: &str,
+    sender: &str,
+    voter: &wacore_binary::jid::Jid,
     poll_chat: &str,
-    voter: &str,
-) -> (bool, String) {
+    option: &str,
+    vote_reply: zeroclaw_api::channel::PollVoteReply,
+    passive_group_context: bool,
+    is_group: bool,
+) -> ChannelMessage {
     use zeroclaw_api::channel::PollVoteReply;
-    match vote_reply {
+    let (addressed, reply_target) = match vote_reply {
         PollVoteReply::Ignore => (false, poll_chat.to_string()),
         PollVoteReply::InChat => (true, poll_chat.to_string()),
-        PollVoteReply::Direct => (true, voter.to_string()),
+        PollVoteReply::Direct => (true, voter.to_non_ad_string()),
+    };
+    ChannelMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        channel: "whatsapp".to_string(),
+        channel_alias: Some(alias.to_string()),
+        sender: sender.to_string(),
+        platform_sender_id: None,
+        reply_target,
+        content: format!("[choice]{option}"),
+        timestamp: chrono::Utc::now().timestamp() as u64,
+        thread_ts: None,
+        interruption_scope_id: None,
+        attachments: Vec::new(),
+        subject: None,
+        internal_sop_event: None,
+        // Only the poll's own setting decides this. An `ignore` poll asked a
+        // question and wants no answer, in a group whose messages are already
+        // context and in a direct chat alike, so the vote is recorded either
+        // way and starts no turn.
+        passive_context: !addressed,
+        explicitly_addressed: addressed,
+        conversation_scope: if addressed {
+            ChannelConversationScope::Sender
+        } else {
+            WhatsAppWebChannel::group_context_scope(passive_group_context, is_group)
+        },
+        references: Vec::new(),
+        // A vote is not spoken input.
+        voice_origin: false,
     }
 }
 
@@ -4602,28 +4617,108 @@ mod tests {
         );
     }
 
+    /// Group and direct alike: `ignore` means the vote is recorded and
+    /// nothing else. An earlier revision read `passive_group_context` here,
+    /// so a group without that setting - and every direct chat - had the
+    /// agent answering voters the poll never asked to answer.
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn a_polls_own_setting_decides_what_its_votes_do() {
+    fn an_ignored_vote_is_recorded_without_starting_a_turn() {
         use zeroclaw_api::channel::PollVoteReply;
         let group = "120363000000000001@g.us";
-        let voter = "+15550001111";
+        let voter: Jid = "15550001111@s.whatsapp.net".parse().expect("voter");
+
+        for (passive_group_context, is_group, chat) in [
+            (true, true, group),
+            (false, true, group),
+            (false, false, "15550001111@s.whatsapp.net"),
+        ] {
+            let msg = vote_message(
+                "ventas",
+                "+15550001111",
+                &voter,
+                chat,
+                "Malbec",
+                PollVoteReply::Ignore,
+                passive_group_context,
+                is_group,
+            );
+            assert!(
+                msg.passive_context,
+                "an ignored vote is context only (passive_group_context={passive_group_context}, is_group={is_group})"
+            );
+            assert!(
+                !msg.explicitly_addressed,
+                "an ignored vote asks the agent for nothing (passive_group_context={passive_group_context}, is_group={is_group})"
+            );
+            assert_eq!(msg.content, "[choice]Malbec");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn an_in_chat_vote_answers_where_the_poll_was_posted() {
+        use zeroclaw_api::channel::PollVoteReply;
+        let group = "120363000000000001@g.us";
+
+        let msg = vote_message(
+            "ventas",
+            "+15550001111",
+            &"15550001111@s.whatsapp.net".parse::<Jid>().expect("voter"),
+            group,
+            "Malbec",
+            PollVoteReply::InChat,
+            true,
+            true,
+        );
 
         assert_eq!(
-            vote_delivery(PollVoteReply::Ignore, group, voter),
-            (false, group.to_string()),
-            "an opinion poll records votes without starting a turn"
+            msg.reply_target, group,
+            "the answer goes to the poll's chat"
         );
-        assert_eq!(
-            vote_delivery(PollVoteReply::InChat, group, voter),
-            (true, group.to_string()),
-            "a poll that answers its voters replies where it was posted"
-        );
-        assert_eq!(
-            vote_delivery(PollVoteReply::Direct, group, voter),
-            (true, voter.to_string()),
-            "taking the voter aside answers them, not the group"
-        );
+        assert!(msg.explicitly_addressed, "the poll asked for an answer");
+        assert!(!msg.passive_context, "an answered vote is not mere context");
+    }
+
+    /// A private answer has to land in the voter's ordinary conversation:
+    /// their chat address, not a bare phone number. An earlier revision sent
+    /// the normalized number, which keys a different session from the one
+    /// their next direct message opens, and dropped a LID voter's namespace.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_direct_vote_answers_the_voter_in_their_own_chat() {
+        use zeroclaw_api::channel::PollVoteReply;
+        let group = "120363000000000001@g.us";
+
+        // As a vote arrives: a group participant, addressed by phone number or
+        // by LID, and carrying the device the vote was cast from.
+        for (voter, chat) in [
+            (
+                "15550001111:12@s.whatsapp.net",
+                "15550001111@s.whatsapp.net",
+            ),
+            ("76188559093817:3@lid", "76188559093817@lid"),
+        ] {
+            let voter: Jid = voter.parse().expect("voter");
+            let msg = vote_message(
+                "ventas",
+                "+15550001111",
+                &voter,
+                group,
+                "Malbec",
+                PollVoteReply::Direct,
+                true,
+                true,
+            );
+
+            assert_eq!(
+                msg.reply_target,
+                WhatsAppWebChannel::compute_reply_target(chat),
+                "a vote and a direct message from {voter} address the same chat"
+            );
+            assert!(msg.explicitly_addressed, "the poll asked for an answer");
+            assert!(!msg.passive_context);
+        }
     }
 
     /// The bug this guards cost a live debugging session: a mixed pair
