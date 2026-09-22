@@ -749,11 +749,19 @@ impl WhatsAppWebChannel {
     /// Like [`Self::is_number_allowed`], except that a `*` entry admits no one.
     /// "May message whoever writes to us" does not imply "may add anyone to a
     /// group", so a group participant needs an entry naming its number.
+    ///
+    /// Everything else about the policy is unchanged, because this asks the
+    /// same deny-aware matcher admission uses. Reading the entries directly
+    /// here, as an earlier revision did, dropped the `!` that marks a deny
+    /// during phone normalization, so `ignore = ["+15550001111"]` authorized
+    /// exactly the number the operator wrote down to keep out.
     #[cfg(feature = "whatsapp-web")]
     fn is_number_explicitly_allowed(&self, phone: &str) -> bool {
-        (self.peer_resolver)()
-            .iter()
-            .any(|entry| entry.trim() != "*" && Self::phone_matches(entry, phone))
+        crate::allowlist::is_identity_named_by(
+            &(self.peer_resolver)(),
+            &[phone],
+            Self::phone_matches,
+        )
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -8430,6 +8438,35 @@ mod tests {
             "15550001111@s.whatsapp.net"
         );
         assert!(explicit.group_participant_jid("+15550002222").is_err());
+    }
+
+    /// A deny is how an operator says "not this person", and a resolved peer
+    /// list carries one `!number` for every `ignore` entry. Reading the entries
+    /// as plain numbers turned each of those into permission to add or contact
+    /// exactly the person it named.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_denied_participant_is_refused_however_the_deny_is_written() {
+        for entries in [
+            // Nothing but a deny: no grant was ever written.
+            vec!["!+15550001111"],
+            // The deny overrides the grant, as it does for admission.
+            vec!["+15550001111", "!+15550001111"],
+            // A deny written in another accepted spelling of the same number.
+            vec!["+15550001111", "!15550001111@s.whatsapp.net"],
+            // `ignore = ["*"]` denies everyone, grants notwithstanding.
+            vec!["+15550001111", "!*"],
+        ] {
+            let ch = room_channel(true, &entries);
+            assert!(
+                ch.group_participant_jid("+15550001111").is_err(),
+                "{entries:?} must not authorize the number it denies"
+            );
+        }
+
+        // The deny is not a blanket refusal: a grant it does not name stands.
+        let ch = room_channel(true, &["+15550002222", "!+15550001111"]);
+        assert!(ch.group_participant_jid("+15550002222").is_ok());
     }
 
     #[test]
