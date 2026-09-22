@@ -90,14 +90,11 @@ allowed_groups = ["120363012345678901@g.us", "120363098765432109"]
 
 ## Polls
 
-The `poll` tool posts a native WhatsApp poll (Web mode) instead of the numbered
-text message it falls back to on channels without native polls. Two to twelve
-options; `multi_select` lets one voter pick every option. The recipient goes
-through the same allowlist as an ordinary message, and a recipient that is not
-allowed fails instead of silently doing nothing.
+The `poll` tool posts a native WhatsApp poll in Web mode instead of the numbered text fallback used on channels without native polls. The tool accepts 2–10 options; the WhatsApp library accepts up to 12, but the tool schema does not expose 11–12. `multi_select` lets a voter select multiple options.
 
-Votes are not read back yet: the poll card shows the result to the people in
-the chat, and the agent only learns that the poll was posted.
+Raw phone-number recipients are checked against the channel's number allowlist, and a disallowed number returns an error instead of silently doing nothing. As with ordinary sends, JID recipients bypass that number check. `duration_minutes` does not expire a native poll.
+
+Votes are not read back yet: the poll card shows the result to people in the chat, and the agent only learns that the poll was posted.
 
 ## Tool approval over chat (`approval_timeout_secs`)
 
