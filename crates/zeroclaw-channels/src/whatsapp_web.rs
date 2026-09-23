@@ -2402,11 +2402,29 @@ enum WhatsAppMediaKind {
     Voice,
 }
 
-/// Upper bound for each preview step (a tool run, or the preview upload). The
-/// preview is best-effort, so a slow or stuck step must not hold up the
-/// document it decorates.
+/// Upper bound for each preview step (a tool run, or the whole preview
+/// upload). The preview is best-effort, so a slow or stuck step must not hold
+/// up the document it decorates.
+///
+/// For the upload this is a budget for the host loop, not the deadline that
+/// stops a request: dropping a future cannot cancel work already handed to a
+/// blocking client. The deadline that does the stopping is
+/// [`DOCUMENT_THUMBNAIL_TIMEOUT_SECS`], enforced by the transport itself.
 #[cfg(feature = "whatsapp-web")]
 const DOCUMENT_PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Transport deadlines for one thumbnail upload request.
+///
+/// The thumbnail is decoration: a CDN host that accepts the connection and
+/// then says nothing must cost the document a few seconds, not the send. These
+/// are deliberately shorter than anything the document's own upload uses, and
+/// they are enforced by the HTTP client, so the request ends rather than being
+/// abandoned while it runs on.
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_THUMBNAIL_TIMEOUT_SECS: u64 = 4;
+
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_THUMBNAIL_CONNECT_TIMEOUT_SECS: u64 = 2;
 
 /// Longest side of the JPEG carried inline in the message. Phones drop a
 /// larger inline preview (a 600 px one never showed), so this stays at the
@@ -2694,26 +2712,68 @@ async fn upload_document_thumbnail(
         .map_err(|_| "could not get media hosts".to_string())?;
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob.enc_sha256);
     let body = bytes::Bytes::from(blob.data);
+    let requests: Vec<wacore::net::HttpRequest> = conn
+        .hosts
+        .iter()
+        .map(|host| document_thumbnail_upload_request(&host.hostname, &conn.auth, &token))
+        .collect();
+    // Not the client the library uses for media: that one runs a blocking
+    // request under `spawn_blocking` with no deadline of its own, so a host
+    // that stops responding leaves the request running after this future is
+    // dropped. This one carries its own deadlines, and dropping it ends the
+    // request.
+    let http = zeroclaw_config::schema::build_channel_proxy_client_with_timeouts(
+        "channel.whatsapp.document_thumbnail",
+        None,
+        DOCUMENT_THUMBNAIL_TIMEOUT_SECS,
+        DOCUMENT_THUMBNAIL_CONNECT_TIMEOUT_SECS,
+    );
+    let direct_path = post_document_thumbnail(&http, &requests, body).await?;
+    Ok(UploadedThumbnail {
+        direct_path,
+        sha256: blob.sha256,
+        enc_sha256: blob.enc_sha256,
+        width: thumbnail.width,
+        height: thumbnail.height,
+    })
+}
+
+/// POST the encrypted thumbnail to each media host in turn, returning the
+/// `direct_path` the first one that accepts it reports.
+///
+/// Takes the composed requests rather than hostnames: the caller owns where
+/// the thumbnail goes, and this owns what happens on the wire, which is what
+/// lets the transport behaviour be exercised against a real socket. Everything
+/// above it needs a paired client, and none of it decides what a host that
+/// goes quiet costs the document.
+#[cfg(feature = "whatsapp-web")]
+async fn post_document_thumbnail(
+    http: &reqwest::Client,
+    requests: &[wacore::net::HttpRequest],
+    body: bytes::Bytes,
+) -> std::result::Result<String, String> {
     let mut last_error = "no media hosts".to_string();
-    for host in &conn.hosts {
-        let request = document_thumbnail_upload_request(&host.hostname, &conn.auth, &token)
-            .with_body(body.clone());
-        match client.http_client.execute(request).await {
-            Ok(response) if response.status_code == 200 => {
-                match upload_response_direct_path(&response.body) {
-                    Some(direct_path) => {
-                        return Ok(UploadedThumbnail {
-                            direct_path,
-                            sha256: blob.sha256,
-                            enc_sha256: blob.enc_sha256,
-                            width: thumbnail.width,
-                            height: thumbnail.height,
-                        });
-                    }
-                    None => last_error = "upload response had no direct_path".to_string(),
+    for request in requests {
+        let mut post = http.post(&request.url).body(body.clone());
+        for (key, value) in &request.headers {
+            post = post.header(key, value);
+        }
+        match post.send().await {
+            Ok(response) if response.status() == reqwest::StatusCode::OK => {
+                match response.bytes().await {
+                    Ok(payload) => match upload_response_direct_path(&payload) {
+                        Some(direct_path) => return Ok(direct_path),
+                        None => last_error = "upload response had no direct_path".to_string(),
+                    },
+                    Err(_) => last_error = "upload response body could not be read".to_string(),
                 }
             }
-            Ok(response) => last_error = format!("upload returned {}", response.status_code),
+            Ok(response) => last_error = format!("upload returned {}", response.status().as_u16()),
+            // The deadline lands here, as an ordinary request failure: the
+            // request is over, and the next host gets its own budget.
+            Err(e) if e.is_timeout() => {
+                last_error = format!("upload timed out after {DOCUMENT_THUMBNAIL_TIMEOUT_SECS}s");
+            }
             Err(_) => last_error = "upload request failed".to_string(),
         }
     }
@@ -9197,6 +9257,61 @@ mod tests {
         oversized.resize(DOCUMENT_PREVIEW_INLINE_MAX_BYTES + 1, 0);
         assert!(
             DocumentThumbnail::from_jpeg(oversized, DOCUMENT_PREVIEW_INLINE_MAX_BYTES).is_none()
+        );
+    }
+
+    /// The failure this guards is the one that does not look like a failure:
+    /// a media host that accepts the connection and then says nothing. An
+    /// `await` deadline around a request cannot end it, so the deadline has to
+    /// belong to the transport. What the caller must see is an error, soon,
+    /// after which the document goes out with the inline preview it already
+    /// has — the fallback `inline_only_preview_fills_the_card_with_its_own_size`
+    /// covers.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_silent_thumbnail_host_ends_the_request_rather_than_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let host = listener.local_addr().expect("addr").to_string();
+        // Take the request in full and then say nothing: the connection is
+        // open, the upload was accepted, and no status line ever comes. That is
+        // the shape the report names, and the one an `await` deadline around a
+        // blocking client cannot end.
+        let silent = ::zeroclaw_spawn::spawn!(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut scratch = [0u8; 1024];
+            let _read = tokio::io::AsyncReadExt::read(&mut socket, &mut scratch).await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .connect_timeout(std::time::Duration::from_millis(500))
+            .build()
+            .expect("client");
+
+        let started = std::time::Instant::now();
+        let result = post_document_thumbnail(
+            &http,
+            &[wacore::net::HttpRequest::post(format!(
+                "http://{host}/upload"
+            ))],
+            bytes::Bytes::from_static(b"encrypted thumbnail"),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        silent.abort();
+
+        assert!(
+            result.is_err(),
+            "a host that never answers cannot report a direct_path"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the request ended on its own deadline rather than outliving the send, in {elapsed:?}"
         );
     }
 
