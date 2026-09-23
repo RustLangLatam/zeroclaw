@@ -2649,9 +2649,14 @@ fn markdown_to_whatsapp(text: &str) -> String {
     let mut result_lines: Vec<String> = Vec::new();
     // Length of the backtick run that opened the current fenced block.
     let mut open_fence: Option<usize> = None;
-    // The source of the last line emitted as an ordinary paragraph, which is
-    // the only thing a setext underline can underline.
-    let mut paragraph: Option<&str> = None;
+    // The source lines of the paragraph currently open, which is the only
+    // thing a setext underline can underline. A whole run, not the last line:
+    // an underline turns every line above it into one heading.
+    let mut paragraph: Vec<&str> = Vec::new();
+    // Whether a block that is not a paragraph is open. Its continuation lines
+    // are part of it, not a paragraph of their own, so an underline below them
+    // underlines nothing: `- item` / `first` / `---` is a list and a break.
+    let mut in_block = false;
     // A thematic break was dropped and still owes the blank line it stood for.
     // Owed rather than emitted, so a break at either end of the text adds no
     // stray blank line and running the conversion twice changes nothing.
@@ -2676,11 +2681,19 @@ fn markdown_to_whatsapp(text: &str) -> String {
         // heading. Checked before the thematic break below, because `---`
         // under a paragraph is a heading in CommonMark and a separator only
         // everywhere else.
-        if let Some(title) = paragraph.filter(|_| is_setext_underline(line)) {
-            result_lines.pop();
-            let title = markdown_inline_to_whatsapp_in(title.trim(), true);
+        if !paragraph.is_empty() && is_setext_underline(line) {
+            result_lines.truncate(result_lines.len() - paragraph.len());
+            // The soft line breaks inside the heading become spaces, which is
+            // how CommonMark renders them and the only shape WhatsApp has for
+            // a heading: one bold line.
+            let title = paragraph
+                .iter()
+                .map(|line| line.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let title = markdown_inline_to_whatsapp_in(&title, true);
             result_lines.push(format!("*{title}*"));
-            paragraph = None;
+            paragraph.clear();
             continue;
         }
 
@@ -2690,7 +2703,8 @@ fn markdown_to_whatsapp(text: &str) -> String {
         // between the paragraphs it separated.
         if is_thematic_break(line) {
             owed_separation = true;
-            paragraph = None;
+            paragraph.clear();
+            in_block = false;
             continue;
         }
 
@@ -2717,7 +2731,8 @@ fn markdown_to_whatsapp(text: &str) -> String {
             let indent = &line[..line.len() - trimmed.len()];
             result_lines.push(format!("{indent}{}", &trimmed[..run]));
             open_fence = Some(run);
-            paragraph = None;
+            paragraph.clear();
+            in_block = true;
             continue;
         }
 
@@ -2729,14 +2744,24 @@ fn markdown_to_whatsapp(text: &str) -> String {
             // markers instead of gaining a second wrapper around them.
             let title = markdown_inline_to_whatsapp_in(after_hashes.trim(), true);
             result_lines.push(format!("*{title}*"));
-            paragraph = None;
+            paragraph.clear();
             continue;
         }
 
         // Only an ordinary paragraph line can be underlined into a heading. A
         // list item or a block quote is not one, which is why `- item` over
-        // `---` stays a list followed by a separator.
-        paragraph = (!trimmed.is_empty() && !starts_a_block(trimmed)).then_some(line);
+        // `---` stays a list followed by a separator. Indented code is not one
+        // either, but it cannot interrupt a paragraph already open: inside a
+        // run the same indentation is a lazy continuation line.
+        if trimmed.is_empty() {
+            paragraph.clear();
+            in_block = false;
+        } else if starts_a_block(trimmed) || (paragraph.is_empty() && is_indented_code(line)) {
+            paragraph.clear();
+            in_block = true;
+        } else if !in_block {
+            paragraph.push(line);
+        }
         result_lines.push(markdown_inline_to_whatsapp(line));
     }
 
@@ -2754,6 +2779,14 @@ fn is_setext_underline(line: &str) -> bool {
         return false;
     }
     body.chars().all(|c| c == '=') || body.chars().all(|c| c == '-')
+}
+
+/// Whether `line` opens an indented code block: four spaces or a tab. Only
+/// meaningful where no paragraph is open, because indented code cannot
+/// interrupt one.
+#[cfg(feature = "whatsapp-web")]
+fn is_indented_code(line: &str) -> bool {
+    line.starts_with("    ") || line.starts_with('\t')
 }
 
 /// Whether `line` is a CommonMark thematic break: three or more `*`, `-` or
@@ -8815,6 +8848,59 @@ mod tests {
         );
     }
 
+    /// An underline underlines the whole paragraph, not the line above it.
+    /// `first\nsecond\n---` is one heading in CommonMark, and WhatsApp has
+    /// only one shape for a heading, so the soft line break becomes a space.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_setext_heading_covers_every_line_of_its_paragraph() {
+        assert_eq!(markdown_to_whatsapp("first\nsecond\n---"), "*first second*");
+        assert_eq!(
+            markdown_to_whatsapp("first\nsecond\nthird\n==="),
+            "*first second third*"
+        );
+        // The heading sheds its own bold markers, as an ATX heading does.
+        assert_eq!(
+            markdown_to_whatsapp("**first**\nsecond\n---"),
+            "*first second*"
+        );
+        // Only the paragraph the underline belongs to: a blank line ends one.
+        assert_eq!(
+            markdown_to_whatsapp("before\n\nfirst\nsecond\n---"),
+            "before\n\n*first second*"
+        );
+        // And the run ends at the block above it, not before.
+        assert_eq!(
+            markdown_to_whatsapp("- item\nfirst\n---"),
+            "- item\nfirst",
+            "`first` continues the list item, so the rule underlines nothing \
+             and closes the list instead"
+        );
+    }
+
+    /// Four spaces or a tab is indented code, which this converter leaves
+    /// alone: it is not a paragraph, so the rule below it is a separator and
+    /// not an underline. But it cannot interrupt a paragraph already open,
+    /// where the same indentation is a lazy continuation line.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn indented_code_is_not_underlined_but_does_not_break_a_paragraph() {
+        assert_eq!(
+            markdown_to_whatsapp("    code\n---\nnext"),
+            "    code\n\nnext"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("\tcode\n---\nnext"),
+            "\tcode\n\nnext",
+            "a tab indents code the same way"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("first\n    second\n---"),
+            "*first second*",
+            "inside a paragraph the indented line is a continuation, not code"
+        );
+    }
+
     /// The ambiguous case: a rule under a list item underlines nothing.
     #[test]
     #[cfg(feature = "whatsapp-web")]
@@ -8837,6 +8923,43 @@ mod tests {
     fn rules_and_underlines_inside_a_fence_are_untouched() {
         let fenced = "```\n---\n***\nTitle\n===\n```";
         assert_eq!(markdown_to_whatsapp(fenced), fenced);
+    }
+
+    /// The cases this converter has to get wrong-proof: the same three lines
+    /// mean different things depending on what sits above them.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn the_same_rule_reads_differently_by_position() {
+        for (source, want, why) in [
+            (
+                "Title\n---\nbody",
+                "*Title*\nbody",
+                "under a paragraph: heading",
+            ),
+            (
+                "Title\n\n---\nbody",
+                "Title\n\nbody",
+                "after a blank line the paragraph has closed: break, and the \
+                 line above stays plain",
+            ),
+            (
+                "> quoted\n---\nbody",
+                "> quoted\n\nbody",
+                "under a quote: break",
+            ),
+            (
+                "    code\n---\nbody",
+                "    code\n\nbody",
+                "under indented code: break",
+            ),
+            (
+                "```\nTitle\n---\n```",
+                "```\nTitle\n---\n```",
+                "inside a fence: nothing",
+            ),
+        ] {
+            assert_eq!(markdown_to_whatsapp(source), want, "{why}");
+        }
     }
 
     #[test]
