@@ -182,9 +182,15 @@ Speaking a reply needs `tts.enabled` and a `tts_provider` on the owning agent.
 An agent with no provider named stays silent rather than picking one, and says
 so in the log.
 
-**A chat is answered by voice when the last message it received was a voice
-note.** The state is per chat, not per sender, and any later message that is
-not a voice note clears it, so a conversation drops back to text as soon as
+**A chat is answered by voice once a voice note from it has been transcribed.**
+Receiving the audio is not enough: a note that is skipped, that fails to
+download, or that comes back with an empty transcript leaves the chat as it
+was. A message that never reaches this point at all, because a policy dropped
+it or because it is passive group context, leaves it alone too. With
+`transcribe_non_ptt_audio` on, other transcribed audio sets it as well.
+
+The state is per chat, not per sender, and the next processed message that is
+not transcribed audio clears it, so a conversation drops back to text once
 someone types. In a group that means whoever spoke last decides, and the spoken
 reply is audible to the whole group.
 
@@ -192,18 +198,25 @@ When the reply is spoken, the chat gets **both**: the text as usual, and a
 voice note alongside it. The chat keeps a readable record, and nothing is only
 available as audio.
 
-Three things shape the voice note itself:
+Four things shape the voice note itself:
 
 - It is sent as a real voice note (`ptt`), Opus-encoded, not as an audio
   attachment, so it renders as the waveform bubble rather than a file card.
-- One reply is spoken per voice note received. The channel waits about ten
-  seconds after the last message before synthesizing, so an agent that answers
-  in several parts, or runs a chain of tools first, produces a single voice
-  note carrying the final answer rather than one per fragment.
-- Replies that do not read well aloud stay text-only: anything under 40 bytes,
-  or that begins with a URL, a JSON document, a bracketed marker or `Error`, or
-  that carries a code fence, tool-call markup or raw weather-tool output. These
-  are shapes, not settings; a reply is judged by what it looks like.
+- What is spoken is the last eligible reply the chat produced, after about ten
+  quiet seconds. The queue holds one reply per chat and each new one replaces
+  the last, so an answer that arrives in several parts is not read out in full:
+  the part that was queued when the pause ran out is the part that is spoken.
+  Nothing tells the channel that an answer is complete.
+- Typing does not call back a reply already queued. Clearing the chat's state
+  stops the *next* reply from being queued; the task already waiting never
+  looks at that state again, and hands its reply to the synthesizer regardless.
+  So a message typed during those ten seconds is answered in text, while the
+  reply that was already waiting is still spoken.
+- Replies that do not read well aloud stay text-only: anything of 40 bytes or
+  fewer, or that begins with a URL, a JSON document, a bracketed marker or
+  `Error`, or that carries a code fence, tool-call markup or raw weather-tool
+  output. These are shapes, not settings; a reply is judged by what it looks
+  like.
 
 ### What does not apply here
 
