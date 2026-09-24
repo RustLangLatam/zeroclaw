@@ -155,19 +155,28 @@ struct CronChannelRegistryLease {
 
 impl Drop for CronChannelRegistryLease {
     fn drop(&mut self) {
-        // Before the registry itself: a session that already copied these
-        // instances out keeps them until they are taken back, and clearing
-        // the registry cannot reach a copy.
-        retire_seeded_channels(&self.published);
-        let mut current = CRON_CHANNEL_REGISTRY
-            .write()
+        // Withdrawing the generation and taking it back from the sessions it
+        // reached happen under one lock, the same one an installation holds
+        // while it decides whether its chosen generation is still live. That
+        // is what makes a concurrent registration safe in either order rather
+        // than in one particular order: it either completes before this runs,
+        // and the sweep below reaches what it installed, or it finds the
+        // registry no longer naming its generation and installs nothing live.
+        let mut seeded = SEEDED_TOOL_HANDLES
+            .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if current
-            .as_ref()
-            .is_some_and(|registry| Arc::ptr_eq(registry, &self.published))
         {
-            *current = Some(Arc::new(HashMap::new()));
+            let mut current = CRON_CHANNEL_REGISTRY
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if current
+                .as_ref()
+                .is_some_and(|registry| Arc::ptr_eq(registry, &self.published))
+            {
+                *current = Some(Arc::new(HashMap::new()));
+            }
         }
+        retire_seeded_channels(&mut seeded, &self.published);
     }
 }
 
@@ -182,19 +191,53 @@ static SEEDED_TOOL_HANDLES: std::sync::Mutex<Vec<SeededToolHandle>> =
 /// A [`tools::PerToolChannelHandle`] this process seeded, held weakly.
 type SeededToolHandle = std::sync::Weak<RwLock<HashMap<String, Arc<dyn Channel>>>>;
 
-/// Copy `map` into each tool handle, remembering the handles so the instances
-/// can be withdrawn when the generation they came from retires.
-fn seed_tool_handles(
-    map: &HashMap<String, Arc<dyn Channel>>,
+/// What a registration chose, before it installs anything.
+///
+/// Selection and installation are two steps with a gap between them, and a
+/// reload can retire the chosen generation inside that gap. Keeping the
+/// generation here is what lets the install refuse it: an `Arc` of a retired
+/// registry is still perfectly usable, which is the whole danger.
+struct SelectedChannels {
+    built: HashMap<String, Arc<dyn Channel>>,
+    generation: Option<CronChannelRegistry>,
+}
+
+/// Choose the instances a registration will install: what this surface built
+/// from config, plus the running generation to prefer over it.
+fn select_channels_for_tools(built: HashMap<String, Arc<dyn Channel>>) -> SelectedChannels {
+    SelectedChannels {
+        built,
+        generation: live_channel_registry(),
+    }
+}
+
+/// Copy the selection into each tool handle, remembering the handles so the
+/// instances can be withdrawn when the generation they came from retires.
+///
+/// The generation is re-checked here, under the same lock the retirement sweep
+/// takes, and dropped if it is no longer the published one. Without that a
+/// registration that chose a live instance and then lost the race would
+/// install an authenticated channel that nothing will ever take back, because
+/// the sweep for that generation has already run.
+fn install_selected_channels(
+    selected: SelectedChannels,
     handles: &[&tools::PerToolChannelHandle],
-) {
+) -> HashMap<String, Arc<dyn Channel>> {
     let mut seeded = SEEDED_TOOL_HANDLES
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let generation = selected.generation.filter(|generation| {
+        CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, generation))
+    });
+    let map = prefer_live_channels(selected.built, generation.as_ref());
     seeded.retain(|handle| handle.strong_count() > 0);
     for handle in handles {
         let mut entries = handle.write();
-        for (key, channel) in map {
+        for (key, channel) in &map {
             entries.insert(key.clone(), Arc::clone(channel));
         }
         drop(entries);
@@ -206,6 +249,7 @@ fn seed_tool_handles(
             seeded.push(Arc::downgrade(handle));
         }
     }
+    map
 }
 
 /// Take back every copy of a retired generation's channel instances.
@@ -217,13 +261,10 @@ fn seed_tool_handles(
 /// through an alias the operator had disabled and reloaded away. The entries
 /// are removed by identity, so whatever a session built for itself - its
 /// approval channel, for one - is left alone.
-fn retire_seeded_channels(retired: &CronChannelRegistry) {
+fn retire_seeded_channels(seeded: &mut Vec<SeededToolHandle>, retired: &CronChannelRegistry) {
     if retired.is_empty() {
         return;
     }
-    let mut seeded = SEEDED_TOOL_HANDLES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     seeded.retain(|handle| {
         let Some(handle) = handle.upgrade() else {
             return false;
@@ -12228,12 +12269,9 @@ pub fn register_channels_for_tools(
         escalate_handle.as_ref(),
     ];
 
-    let map = prefer_live_channels(
-        configured_channel_map(&configured),
-        live_channel_registry().as_ref(),
-    );
     let handles: Vec<&tools::PerToolChannelHandle> = handles.into_iter().flatten().collect();
-    seed_tool_handles(&map, &handles);
+    let selected = select_channels_for_tools(configured_channel_map(&configured));
+    let map = install_selected_channels(selected, &handles);
     let mut names: Vec<String> = map.keys().cloned().collect();
     names.sort();
     names
@@ -17479,6 +17517,11 @@ temperature = 0.3
         ));
     }
 
+    /// The registry and the seeded-handle list are process-wide, so the tests
+    /// that publish a generation have to take turns. Without this they pass
+    /// alone and fail together, which is the worst way to learn it.
+    static REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     struct CronChannelRegistryRestore(Option<CronChannelRegistry>);
 
     impl Drop for CronChannelRegistryRestore {
@@ -17489,6 +17532,66 @@ temperature = 0.3
         }
     }
 
+    /// The interleaving the retirement sweep alone cannot cover: a session is
+    /// seeded while the channel is up, but its registration is paused between
+    /// choosing the live instances and installing them, and the alias is
+    /// disabled and reloaded in that gap. Nothing sweeps that copy afterwards,
+    /// because the sweep for its generation has already run, so the install
+    /// itself has to refuse it.
+    #[test]
+    fn a_registration_that_lost_the_race_installs_nothing_live() {
+        let _serialized = REGISTRY_TEST_LOCK.blocking_lock();
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let running = mock_channel("whatsapp");
+        let (_published, lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WhatsApp",
+            alias: Some("ventas".to_string()),
+            channel: Arc::clone(&running),
+        }]);
+
+        // The registration reaches the point of having chosen its instances.
+        let built = configured_channel_map(&[ConfiguredChannel {
+            display_name: "WhatsApp",
+            alias: Some("ventas".to_string()),
+            channel: mock_channel("whatsapp"),
+        }]);
+        let selected = select_channels_for_tools(built);
+        assert!(
+            selected
+                .generation
+                .as_ref()
+                .is_some_and(|generation| generation.contains_key("whatsapp.ventas")),
+            "the registration did choose the running instance"
+        );
+
+        // The alias is disabled and the daemon reloads, all of it, while the
+        // registration is between its two steps.
+        drop(lease);
+
+        // Only now does the registration install what it chose.
+        let session: tools::PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+        let map = install_selected_channels(selected, &[&session]);
+
+        for entry in [
+            map.get("whatsapp.ventas"),
+            session.read().get("whatsapp.ventas"),
+        ] {
+            assert!(
+                !entry.is_some_and(|channel| Arc::ptr_eq(
+                    channel,
+                    &(Arc::clone(&running) as Arc<dyn Channel>)
+                )),
+                "a retired generation must not be installed by a registration that \
+                 chose it before the reload"
+            );
+        }
+    }
+
     /// The lifecycle this guards: a dashboard connection is opened while the
     /// channel is running and is seeded with the authenticated instance, then
     /// the operator disables that alias and reloads. The connection outlives
@@ -17496,6 +17599,7 @@ temperature = 0.3
     /// was serving traffic with, so clearing the registry does not revoke it.
     #[test]
     fn a_retired_generation_is_taken_back_from_the_sessions_it_seeded() {
+        let _serialized = REGISTRY_TEST_LOCK.blocking_lock();
         let previous = CRON_CHANNEL_REGISTRY
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -17522,10 +17626,7 @@ temperature = 0.3
             // Config builds a fresh instance; it has never been paired.
             channel: mock_channel("whatsapp"),
         }]);
-        seed_tool_handles(
-            &prefer_live_channels(built, live_channel_registry().as_ref()),
-            &[&session],
-        );
+        install_selected_channels(select_channels_for_tools(built), &[&session]);
         assert!(
             Arc::ptr_eq(
                 session.read().get("whatsapp.ventas").expect("seeded"),
@@ -17556,6 +17657,7 @@ temperature = 0.3
 
     #[tokio::test]
     async fn ending_channel_task_clears_stale_delivery_handles() {
+        let _serialized = REGISTRY_TEST_LOCK.lock().await;
         let previous = CRON_CHANNEL_REGISTRY
             .read()
             .unwrap_or_else(|e| e.into_inner())
