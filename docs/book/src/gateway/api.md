@@ -146,6 +146,52 @@ placeholders. Neither config read surface returns the underlying secret value.
 `{populated: true}`; `DELETE` clears it and responds with
 `{populated: false}`. There is no HTTP path to retrieve a secret by any means.
 
+## Sending through a channel
+
+`POST /api/channels/{channel}/send` delivers a text message through a running
+channel without starting an agent turn. Use it when an external system has
+already decided what to say, for example a reminder or a notice that no
+inbound message started.
+
+The route is off until you name the channels it may use:
+
+```toml
+[gateway]
+require_pairing = true            # required: the route refuses without pairing
+send_channels = ["whatsapp.sales"]
+```
+
+`{channel}` is the composite `<type>.<alias>` name that `GET /api/channels`
+returns. The request carries the pairing bearer token:
+
+```
+curl -X POST http://localhost:42617/api/channels/whatsapp.sales/send \
+  -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"15550001111","content":"Your order is ready."}'
+```
+
+- `to` is the recipient in the channel's own addressing, as its replies use
+  it: a phone number or JID on WhatsApp, a chat id on Telegram.
+- `content` is plain text. Attachment markers such as `[IMAGE:...]` are
+  refused, so a caller cannot make the channel upload files from its
+  workspace.
+- `thread_id` is optional, for channels with threads.
+
+Delivery takes the same path as cron announcements. It reuses the
+channel's live instance, which is the only instance a session-bound channel
+such as WhatsApp Web can send through, and it applies the same outbound
+leak redaction.
+
+| Status | Meaning |
+|---|---|
+| `200` | Sent. Body: `{channel, to, outcome: "sent"}`. |
+| `400` | `to` or `content` is blank, or `content` carries an attachment marker. |
+| `401` | Missing or invalid bearer token. |
+| `403` | Pairing is off, or the channel is not in `send_channels`. |
+| `404` | No such channel is configured. |
+| `502` | The channel failed to deliver, for example because it is not running. |
+
 ## Stable error codes
 
 Errors return JSON with a stable `code` field plus a human-readable `message`.

@@ -155,6 +155,34 @@ pub fn prepare_live_channel_registry(expect_channels: bool) {
         .unwrap_or_else(|e| e.into_inner()) = expect_channels.then(|| Arc::new(HashMap::new()));
 }
 
+/// Publish `channels`, keyed by composite `<type>.<alias>` name, as the
+/// running generation, so a test outside this crate can deliver through a live
+/// instance the way the daemon's channel task would provide one. The previous
+/// registry is restored when the guard drops.
+#[cfg(feature = "test-util")]
+pub fn publish_live_channels_for_test(
+    channels: HashMap<String, Arc<dyn Channel>>,
+) -> LiveChannelsTestGuard {
+    let mut registry = CRON_CHANNEL_REGISTRY
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let previous = registry.replace(Arc::new(channels));
+    LiveChannelsTestGuard(previous)
+}
+
+/// Restores the registry [`publish_live_channels_for_test`] replaced.
+#[cfg(feature = "test-util")]
+pub struct LiveChannelsTestGuard(Option<CronChannelRegistry>);
+
+#[cfg(feature = "test-util")]
+impl Drop for LiveChannelsTestGuard {
+    fn drop(&mut self) {
+        *CRON_CHANNEL_REGISTRY
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = self.0.take();
+    }
+}
+
 /// Owns one published registry generation for the lifetime of its channel task.
 /// A stale task must not clear a newer task's replacement when it finally exits.
 struct CronChannelRegistryLease {

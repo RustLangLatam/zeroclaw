@@ -1455,6 +1455,151 @@ pub async fn handle_api_channel_relink(
     }
 }
 
+/// Body of `POST /api/channels/{channel}/send`.
+#[derive(Deserialize)]
+pub struct ChannelSendBody {
+    /// Recipient in the channel's own addressing, as the channel's replies
+    /// use it (a WhatsApp JID or phone number, a Telegram chat id, ...).
+    pub to: String,
+    /// Plain text to deliver. Attachment markers are refused.
+    pub content: String,
+    /// Optional thread to post in, for channels that have threads.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
+/// POST /api/channels/{channel}/send — deliver text through a running
+/// channel without an agent turn.
+///
+/// `{channel}` is the composite `<type>.<alias>` name from
+/// `GET /api/channels`, and it must be listed in `[gateway] send_channels`.
+/// Delivery goes through [`zeroclaw_channels::orchestrator::deliver_announcement`],
+/// the path cron announcements take: it reuses the channel's live instance
+/// when the daemon is running it, which is the only instance a session-bound
+/// channel such as WhatsApp Web can send through, and it applies the same
+/// outbound leak redaction.
+///
+/// Responses:
+///
+/// - `200` with `"outcome": "sent"`.
+/// - `400` when `to` or `content` is blank, or `content` carries an
+///   attachment marker. The route is text-only: a marker would let the caller
+///   make the channel upload files from its workspace.
+/// - `403` when pairing is off, or the channel is not in `send_channels`.
+/// - `404` when no such channel is configured.
+/// - `502` when the channel fails to deliver, for example because it is not
+///   running.
+pub async fn handle_api_channel_send(
+    State(state): State<AppState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ChannelSendBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Without pairing every request authenticates, so nothing would stand
+    // between an anonymous caller and messages to third parties.
+    if !state.pairing.require_pairing() {
+        return channel_send_error(
+            StatusCode::FORBIDDEN,
+            &channel,
+            "sending through a channel requires [gateway] require_pairing = true".to_string(),
+        );
+    }
+
+    let config = state.config.read().clone();
+    let configured = config
+        .channels_by_alias()
+        .into_iter()
+        .any(|info| format!("{}.{}", info.channel_type, info.alias) == channel);
+    if !configured {
+        return channel_send_error(
+            StatusCode::NOT_FOUND,
+            &channel,
+            format!("unknown channel {channel} — use the composite name from GET /api/channels"),
+        );
+    }
+    if !config.gateway.send_channels.contains(&channel) {
+        return channel_send_error(
+            StatusCode::FORBIDDEN,
+            &channel,
+            format!("channel {channel} is not listed in [gateway] send_channels"),
+        );
+    }
+
+    let to = body.to.trim();
+    if to.is_empty() || body.content.trim().is_empty() {
+        return channel_send_error(
+            StatusCode::BAD_REQUEST,
+            &channel,
+            "`to` and `content` must not be empty".to_string(),
+        );
+    }
+    let (_, markers) = zeroclaw_channels::util::parse_attachment_markers(&body.content);
+    if !markers.is_empty() {
+        return channel_send_error(
+            StatusCode::BAD_REQUEST,
+            &channel,
+            "`content` must be plain text; attachment markers are not accepted".to_string(),
+        );
+    }
+
+    let thread_id = body.thread_id.filter(|t| !t.trim().is_empty());
+    match zeroclaw_channels::orchestrator::deliver_announcement(
+        &config,
+        &channel,
+        to,
+        thread_id,
+        &body.content,
+    )
+    .await
+    {
+        Ok(()) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({"channel": channel})),
+                "message sent through channel by API"
+            );
+            Json(serde_json::json!({
+                "channel": channel,
+                "to": to,
+                "outcome": "sent",
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"channel": channel, "reason": e.to_string()})),
+                "message send through channel by API failed"
+            );
+            channel_send_error(
+                StatusCode::BAD_GATEWAY,
+                &channel,
+                format!("channel failed to deliver: {e}"),
+            )
+        }
+    }
+}
+
+fn channel_send_error(
+    status: StatusCode,
+    channel: &str,
+    error: String,
+) -> axum::response::Response {
+    (
+        status,
+        Json(serde_json::json!({ "channel": channel, "error": error })),
+    )
+        .into_response()
+}
+
 /// GET /api/tuis — list connected TUI sessions
 pub async fn handle_api_tuis(
     State(state): State<AppState>,
@@ -3212,6 +3357,242 @@ pub(crate) mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── POST /api/channels/{channel}/send ──
+
+    const SEND_TOKEN: &str = "send-test-token";
+
+    /// The live registry is process-wide, so the tests that publish into it
+    /// take turns.
+    static LIVE_CHANNELS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A stand-in for a running channel: records what it was asked to send,
+    /// or fails every send.
+    struct RecordingChannel {
+        sent: parking_lot::Mutex<Vec<zeroclaw_api::channel::SendMessage>>,
+        fail: bool,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecordingChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(
+                zeroclaw_api::attribution::ChannelKind::Telegram,
+            )
+        }
+        fn alias(&self) -> &str {
+            "default"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::channel::Channel for RecordingChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("channel is not connected");
+            }
+            self.sent.lock().push(message.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `telegram.default` configured, pairing on with [`SEND_TOKEN`], and the
+    /// channel listed in `send_channels` unless `listed` is false.
+    fn send_state(listed: bool) -> AppState {
+        let mut config = config_with_telegram("default");
+        if listed {
+            config.gateway.send_channels = vec!["telegram.default".to_string()];
+        }
+        AppState {
+            pairing: Arc::new(PairingGuard::new(
+                true,
+                &[SEND_TOKEN.to_string()],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
+            ..test_state(config)
+        }
+    }
+
+    fn bearer() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {SEND_TOKEN}")
+                .parse()
+                .expect("header value"),
+        );
+        headers
+    }
+
+    fn send_body(to: &str, content: &str) -> ChannelSendBody {
+        ChannelSendBody {
+            to: to.to_string(),
+            content: content.to_string(),
+            thread_id: None,
+        }
+    }
+
+    async fn send_status(
+        state: AppState,
+        channel: &str,
+        headers: HeaderMap,
+        body: ChannelSendBody,
+    ) -> StatusCode {
+        handle_api_channel_send(State(state), Path(channel.to_string()), headers, Json(body))
+            .await
+            .into_response()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn api_channel_send_delivers_through_the_live_instance() {
+        let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
+        let live = Arc::new(RecordingChannel {
+            sent: parking_lot::Mutex::new(Vec::new()),
+            fail: false,
+        });
+        let _live = zeroclaw_channels::orchestrator::publish_live_channels_for_test(
+            std::collections::HashMap::from([(
+                "telegram.default".to_string(),
+                Arc::clone(&live) as Arc<dyn zeroclaw_api::channel::Channel>,
+            )]),
+        );
+
+        let response = handle_api_channel_send(
+            State(send_state(true)),
+            Path("telegram.default".to_string()),
+            bearer(),
+            Json(ChannelSendBody {
+                to: " 15550001111 ".to_string(),
+                content: "Your order is ready.".to_string(),
+                thread_id: Some("42".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["outcome"], "sent");
+        assert_eq!(json["to"], "15550001111");
+        let sent = live.sent.lock();
+        assert_eq!(sent.len(), 1, "exactly one message reaches the channel");
+        assert_eq!(sent[0].recipient, "15550001111");
+        assert_eq!(sent[0].content, "Your order is ready.");
+        assert_eq!(sent[0].thread_ts.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn api_channel_send_reports_a_failed_delivery_as_bad_gateway() {
+        let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
+        let _live = zeroclaw_channels::orchestrator::publish_live_channels_for_test(
+            std::collections::HashMap::from([(
+                "telegram.default".to_string(),
+                Arc::new(RecordingChannel {
+                    sent: parking_lot::Mutex::new(Vec::new()),
+                    fail: true,
+                }) as Arc<dyn zeroclaw_api::channel::Channel>,
+            )]),
+        );
+
+        let status = send_status(
+            send_state(true),
+            "telegram.default",
+            bearer(),
+            send_body("15550001111", "Your order is ready."),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn api_channel_send_refuses_a_channel_not_listed_in_send_channels() {
+        let status = send_status(
+            send_state(false),
+            "telegram.default",
+            bearer(),
+            send_body("15550001111", "hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn api_channel_send_refuses_while_pairing_is_off() {
+        // Listed, but with pairing off every caller would authenticate.
+        let mut config = config_with_telegram("default");
+        config.gateway.send_channels = vec!["telegram.default".to_string()];
+
+        let status = send_status(
+            test_state(config),
+            "telegram.default",
+            HeaderMap::new(),
+            send_body("15550001111", "hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn api_channel_send_requires_bearer_auth() {
+        let status = send_status(
+            send_state(true),
+            "telegram.default",
+            HeaderMap::new(),
+            send_body("15550001111", "hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_channel_send_unknown_channel_is_not_found() {
+        let status = send_status(
+            send_state(true),
+            "telegram.ghost",
+            bearer(),
+            send_body("15550001111", "hello"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_channel_send_refuses_blank_fields() {
+        for body in [send_body("  ", "hello"), send_body("15550001111", " \n ")] {
+            let status = send_status(send_state(true), "telegram.default", bearer(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// The route is text-only: a marker would have the channel upload a file
+    /// from its workspace on the caller's say-so.
+    #[tokio::test]
+    async fn api_channel_send_refuses_attachment_markers() {
+        for content in [
+            "[IMAGE:/var/lib/zeroclaw/workspace/whatsapp_files/15550002222_ABC_0.jpg]",
+            "See attached [document:/etc/hostname]",
+        ] {
+            let status = send_status(
+                send_state(true),
+                "telegram.default",
+                bearer(),
+                send_body("15550001111", content),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{content}");
+        }
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {

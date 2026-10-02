@@ -2287,6 +2287,10 @@ pub async fn run_gateway_with_plugin_webhooks(
             "/api/channels/{channel}/relink",
             post(api::handle_api_channel_relink),
         )
+        .route(
+            "/api/channels/{channel}/send",
+            post(api::handle_api_channel_send),
+        )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
         .route("/api/sessions", get(api::handle_api_sessions_list))

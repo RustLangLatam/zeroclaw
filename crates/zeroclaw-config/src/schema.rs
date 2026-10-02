@@ -7793,6 +7793,14 @@ pub struct GatewayConfig {
     /// (default: false)
     #[serde(default)]
     pub allow_remote_admin: bool,
+    /// Channels that `POST /api/channels/{channel}/send` may deliver through,
+    /// by composite `<type>.<alias>` name as `GET /api/channels` lists them.
+    /// The route sends text through the running channel without an agent
+    /// turn. Empty (default) refuses every channel. The route also refuses
+    /// while `require_pairing = false`, because it cannot then authenticate
+    /// the caller.
+    #[serde(default)]
+    pub send_channels: Vec<String>,
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
@@ -7974,6 +7982,7 @@ impl Default for GatewayConfig {
             require_pairing: true,
             allow_public_bind: false,
             allow_remote_admin: false,
+            send_channels: Vec::new(),
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
@@ -35603,6 +35612,7 @@ allowed_numbers = ["+1", "+2"]
             require_pairing: true,
             allow_public_bind: false,
             allow_remote_admin: false,
+            send_channels: vec!["whatsapp.sales".into()],
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
@@ -35631,6 +35641,7 @@ allowed_numbers = ["+1", "+2"]
         assert_eq!(parsed.session_ttl_hours, 0);
         assert!(!parsed.allow_public_bind);
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
+        assert_eq!(parsed.send_channels, vec!["whatsapp.sales"]);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
         assert!(parsed.trust_forwarded_headers);
@@ -35658,6 +35669,10 @@ default_temperature = 0.7
         assert!(
             !parsed.gateway.allow_public_bind,
             "Missing [gateway] must default to allow_public_bind=false"
+        );
+        assert!(
+            parsed.gateway.send_channels.is_empty(),
+            "Missing [gateway] must expose no channel to the send route"
         );
     }
 
