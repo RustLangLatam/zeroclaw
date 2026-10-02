@@ -7801,6 +7801,11 @@ pub struct GatewayConfig {
     /// the caller.
     #[serde(default)]
     pub send_channels: Vec<String>,
+    /// When true, `POST /api/channels/{channel}/send` only delivers to group
+    /// chats (WhatsApp ids ending in `@g.us`) and refuses direct chats. For a
+    /// gateway whose agent only ever talks to people in groups it created.
+    #[serde(default)]
+    pub send_groups_only: bool,
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
@@ -7983,6 +7988,7 @@ impl Default for GatewayConfig {
             allow_public_bind: false,
             allow_remote_admin: false,
             send_channels: Vec::new(),
+            send_groups_only: false,
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
@@ -35639,6 +35645,7 @@ allowed_numbers = ["+1", "+2"]
             allow_public_bind: false,
             allow_remote_admin: false,
             send_channels: vec!["whatsapp.sales".into()],
+            send_groups_only: true,
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
@@ -35668,6 +35675,7 @@ allowed_numbers = ["+1", "+2"]
         assert!(!parsed.allow_public_bind);
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
         assert_eq!(parsed.send_channels, vec!["whatsapp.sales"]);
+        assert!(parsed.send_groups_only);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
         assert!(parsed.trust_forwarded_headers);

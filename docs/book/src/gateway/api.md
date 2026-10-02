@@ -209,6 +209,20 @@ have an explicit allowlist entry (a `*` entry does not count). Listing the
 channel and enabling `room_management` is the operator's approval for these
 calls. To post in the new group, use the send route with the group id as `to`.
 
+On a WhatsApp channel, these routes also authorize what they create, so the
+agent behind the gateway does not need a config edit per conversation:
+everyone in `invites` and every invited `user` is added to the channel's
+allowlist (`peer_groups.whatsapp_<alias>`), and a created group is added to
+`allowed_groups`. The change is saved and applies to the running channel
+immediately. Invitees must be phone numbers; anything else is refused with
+`400` before anything is created.
+
+For a gateway whose agent only talks to people in groups it created, set
+`[gateway] send_groups_only = true`: the send route then refuses any `to`
+that is not a group (`...@g.us`) with `403`. Pair it with
+`dm_policy = "ignore"` and `room_invite_fallback = false` on the channel, so
+nothing reaches or leaves a direct chat.
+
 These routes need the channel's live session, so they answer `503` when the
 channel is not running. A refusal or failure inside the channel answers `502`
 with the channel's error text.

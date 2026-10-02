@@ -1516,6 +1516,13 @@ pub async fn handle_api_channel_send(
             "`content` must be plain text; attachment markers are not accepted".to_string(),
         );
     }
+    if config.gateway.send_groups_only && !to.ends_with("@g.us") {
+        return channel_send_error(
+            StatusCode::FORBIDDEN,
+            &channel,
+            "this gateway only sends to group chats ([gateway] send_groups_only)".to_string(),
+        );
+    }
 
     let thread_id = body.thread_id.filter(|t| !t.trim().is_empty());
     match zeroclaw_channels::orchestrator::deliver_announcement(
@@ -1666,6 +1673,13 @@ pub async fn handle_api_channel_room_create(
         Ok(live) => live,
         Err(response) => return *response,
     };
+    // The channel only adds participants it already allows, so authorize
+    // them first. Invitees whose room then fails to appear stay authorized;
+    // that admits them to no chat, since direct chats are not answered and
+    // groups are listed one by one.
+    if let Err(response) = authorize_on_channel(&state, &channel, &body.invites, None).await {
+        return *response;
+    }
 
     let options = zeroclaw_api::channel::RoomCreationOptions {
         name: Some(name.to_string()),
@@ -1675,6 +1689,9 @@ pub async fn handle_api_channel_room_create(
     };
     match live.create_room(&options).await {
         Ok(room) => {
+            if let Err(response) = authorize_on_channel(&state, &channel, &[], Some(&room)).await {
+                return *response;
+            }
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1728,6 +1745,9 @@ pub async fn handle_api_channel_room_invite(
         Ok(live) => live,
         Err(response) => return *response,
     };
+    if let Err(response) = authorize_on_channel(&state, &channel, &[user.to_string()], None).await {
+        return *response;
+    }
 
     match live.invite_user(room.trim(), user).await {
         Ok(()) => {
@@ -1752,6 +1772,106 @@ pub async fn handle_api_channel_room_invite(
             format!("channel did not add the participant: {e}"),
         ),
     }
+}
+
+/// A participant as the WhatsApp allowlist stores it (`+<digits>`), from a
+/// phone number in any of the forms callers use: `+34 675…`, `34675…`,
+/// `whatsapp:+34…` or `34675…@s.whatsapp.net`. `None` for anything else,
+/// such as a LID, which cannot be tied to a number here.
+fn whatsapp_phone_peer(user: &str) -> Option<String> {
+    let user = user.trim();
+    let user = user.strip_prefix("whatsapp:").unwrap_or(user);
+    let user = user.strip_suffix("@s.whatsapp.net").unwrap_or(user);
+    if user.contains('@') {
+        return None;
+    }
+    let digits: String = user.chars().filter(char::is_ascii_digit).collect();
+    let only_number_chars = user
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')'));
+    (only_number_chars && (6..=15).contains(&digits.len())).then(|| format!("+{digits}"))
+}
+
+/// Make what the caller is creating reachable on a WhatsApp channel: add
+/// `users` to the channel's allowlist and `room` to its `allowed_groups`.
+/// The agent behind the gateway is the one that brings people in, so its
+/// invitation is the authorization. Persisted and swapped into the shared
+/// config the running channel reads, so it applies without a restart.
+/// Other channel types are left alone.
+async fn authorize_on_channel(
+    state: &AppState,
+    channel: &str,
+    users: &[String],
+    room: Option<&str>,
+) -> Result<(), Box<axum::response::Response>> {
+    let Some(("whatsapp", alias)) = channel.split_once('.') else {
+        return Ok(());
+    };
+    let mut peers = Vec::new();
+    for user in users {
+        let Some(peer) = whatsapp_phone_peer(user) else {
+            return Err(Box::new(channel_send_error(
+                StatusCode::BAD_REQUEST,
+                channel,
+                format!("participant `{}` must be a phone number", user.trim()),
+            )));
+        };
+        peers.push(peer);
+    }
+    if peers.is_empty() && room.is_none() {
+        return Ok(());
+    }
+
+    let _guard = std::sync::Arc::clone(&state.config_write_lock)
+        .lock_owned()
+        .await;
+    let mut working = state.config.read().clone();
+    let mut changed = false;
+
+    if let Some(room) = room
+        && let Some(wa) = working.channels.whatsapp.get_mut(alias)
+        && !wa.allowed_groups.iter().any(|g| g == room)
+    {
+        wa.allowed_groups.push(room.to_string());
+        changed = true;
+    }
+    if !peers.is_empty() {
+        let group = working
+            .peer_groups
+            .entry(format!("whatsapp_{alias}"))
+            .or_insert_with(|| zeroclaw_config::multi_agent::PeerGroupConfig {
+                channel: zeroclaw_config::providers::ChannelRef::new(channel),
+                ..Default::default()
+            });
+        let digits_of = |p: &str| p.chars().filter(char::is_ascii_digit).collect::<String>();
+        for peer in peers {
+            if !group
+                .external_peers
+                .iter()
+                .any(|known| digits_of(known.as_str()) == digits_of(&peer))
+            {
+                group
+                    .external_peers
+                    .push(zeroclaw_config::multi_agent::PeerUsername::new(peer));
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+
+    // A full save, as the channel-bind route does: peer-group edits are not
+    // dirty-tracked, so an incremental save would drop them on restart.
+    if let Err(e) = working.save().await {
+        return Err(Box::new(channel_send_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            channel,
+            format!("could not save the authorization: {e}"),
+        )));
+    }
+    *state.config.write() = working;
+    Ok(())
 }
 
 fn channel_send_error(
@@ -3956,6 +4076,189 @@ pub(crate) mod tests {
         .await
         .into_response();
         assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── groups-only gateway: rooms and invites authorize what they create ──
+
+    /// `whatsapp.test` configured and listed, pairing on, saving into `dir`.
+    fn whatsapp_send_state(dir: &std::path::Path, groups_only: bool) -> AppState {
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: dir.join("config.toml"),
+            ..Default::default()
+        };
+        config.channels.whatsapp.insert(
+            "test".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some(dir.join("wa.db").display().to_string()),
+                ..Default::default()
+            },
+        );
+        config.gateway.send_channels = vec!["whatsapp.test".to_string()];
+        config.gateway.send_groups_only = groups_only;
+        AppState {
+            pairing: Arc::new(PairingGuard::new(
+                true,
+                &[SEND_TOKEN.to_string()],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
+            ..test_state(config)
+        }
+    }
+
+    fn publish_whatsapp(
+        live: &Arc<RecordingChannel>,
+    ) -> zeroclaw_channels::orchestrator::LiveChannelsTestGuard {
+        zeroclaw_channels::orchestrator::publish_live_channels_for_test(
+            std::collections::HashMap::from([(
+                "whatsapp.test".to_string(),
+                Arc::clone(live) as Arc<dyn zeroclaw_api::channel::Channel>,
+            )]),
+        )
+    }
+
+    fn peers_of(state: &AppState) -> Vec<String> {
+        state
+            .config
+            .read()
+            .peer_groups
+            .get("whatsapp_test")
+            .map(|g| {
+                g.external_peers
+                    .iter()
+                    .map(|p| p.as_str().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn send_groups_only_refuses_direct_chats_and_delivers_to_groups() {
+        let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = Arc::new(RecordingChannel::new(false));
+        let _live = publish_whatsapp(&live);
+
+        let direct = send_status(
+            whatsapp_send_state(dir.path(), true),
+            "whatsapp.test",
+            bearer(),
+            send_body("15550001111", "hello"),
+        )
+        .await;
+        assert_eq!(direct, StatusCode::FORBIDDEN);
+
+        let group = send_status(
+            whatsapp_send_state(dir.path(), true),
+            "whatsapp.test",
+            bearer(),
+            send_body("120363000000000001@g.us", "hello group"),
+        )
+        .await;
+        assert_eq!(group, StatusCode::OK);
+        assert_eq!(live.sent.lock().len(), 1, "only the group message went out");
+    }
+
+    #[tokio::test]
+    async fn room_create_authorizes_the_invitees_and_the_new_group() {
+        let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = Arc::new(RecordingChannel::new(false));
+        let _live = publish_whatsapp(&live);
+        let state = whatsapp_send_state(dir.path(), true);
+
+        let response = handle_api_channel_room_create(
+            State(state.clone()),
+            Path("whatsapp.test".to_string()),
+            bearer(),
+            Json(room_body("Order 1234", &["whatsapp:+1 555 000 1111"])),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(peers_of(&state), vec!["+15550001111"]);
+        assert_eq!(
+            state.config.read().channels.whatsapp["test"].allowed_groups,
+            vec!["120363000000000001@g.us"]
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(on_disk.contains("+15550001111") && on_disk.contains("120363000000000001@g.us"));
+    }
+
+    #[tokio::test]
+    async fn room_invite_authorizes_the_user_once() {
+        let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = Arc::new(RecordingChannel::new(false));
+        let _live = publish_whatsapp(&live);
+        let state = whatsapp_send_state(dir.path(), true);
+
+        for user in [
+            "15550002222",
+            "+1 555 000 2222",
+            "15550002222@s.whatsapp.net",
+        ] {
+            let response = handle_api_channel_room_invite(
+                State(state.clone()),
+                Path((
+                    "whatsapp.test".to_string(),
+                    "120363000000000001@g.us".to_string(),
+                )),
+                bearer(),
+                Json(RoomInviteBody {
+                    user: user.to_string(),
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK, "{user}");
+        }
+        assert_eq!(
+            peers_of(&state),
+            vec!["+15550002222"],
+            "one entry per number"
+        );
+        assert_eq!(live.invites.lock().len(), 3);
+    }
+
+    /// A participant that is not a phone number authorizes nothing and
+    /// creates nothing.
+    #[tokio::test]
+    async fn room_create_refuses_a_non_phone_invitee_before_acting() {
+        let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = Arc::new(RecordingChannel::new(false));
+        let _live = publish_whatsapp(&live);
+        let state = whatsapp_send_state(dir.path(), true);
+
+        let response = handle_api_channel_room_create(
+            State(state.clone()),
+            Path("whatsapp.test".to_string()),
+            bearer(),
+            Json(room_body("Order 1234", &["261654491213840@lid"])),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(live.rooms.lock().is_empty());
+        assert!(peers_of(&state).is_empty());
+    }
+
+    #[test]
+    fn whatsapp_phone_peer_normalizes_numbers_and_rejects_the_rest() {
+        for (input, expected) in [
+            ("+34 675 035 762", Some("+34675035762")),
+            ("34675035762", Some("+34675035762")),
+            ("whatsapp:+34675035762", Some("+34675035762")),
+            ("34675035762@s.whatsapp.net", Some("+34675035762")),
+            ("261654491213840@lid", None),
+            ("120363000000000001@g.us", None),
+            ("alice", None),
+            ("123", None),
+        ] {
+            assert_eq!(whatsapp_phone_peer(input).as_deref(), expected, "{input}");
+        }
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
