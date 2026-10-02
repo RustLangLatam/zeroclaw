@@ -1495,39 +1495,10 @@ pub async fn handle_api_channel_send(
     headers: HeaderMap,
     Json(body): Json<ChannelSendBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    // Without pairing every request authenticates, so nothing would stand
-    // between an anonymous caller and messages to third parties.
-    if !state.pairing.require_pairing() {
-        return channel_send_error(
-            StatusCode::FORBIDDEN,
-            &channel,
-            "sending through a channel requires [gateway] require_pairing = true".to_string(),
-        );
-    }
-
-    let config = state.config.read().clone();
-    let configured = config
-        .channels_by_alias()
-        .into_iter()
-        .any(|info| format!("{}.{}", info.channel_type, info.alias) == channel);
-    if !configured {
-        return channel_send_error(
-            StatusCode::NOT_FOUND,
-            &channel,
-            format!("unknown channel {channel} — use the composite name from GET /api/channels"),
-        );
-    }
-    if !config.gateway.send_channels.contains(&channel) {
-        return channel_send_error(
-            StatusCode::FORBIDDEN,
-            &channel,
-            format!("channel {channel} is not listed in [gateway] send_channels"),
-        );
-    }
+    let config = match exposed_channel_config(&state, &headers, &channel) {
+        Ok(config) => config,
+        Err(response) => return *response,
+    };
 
     let to = body.to.trim();
     if to.is_empty() || body.content.trim().is_empty() {
@@ -1585,6 +1556,201 @@ pub async fn handle_api_channel_send(
                 format!("channel failed to deliver: {e}"),
             )
         }
+    }
+}
+
+/// The checks every route that acts through a channel on a caller's behalf
+/// shares: bearer auth, pairing on, the channel configured, and listed in
+/// `[gateway] send_channels`. Returns the config snapshot to act on.
+fn exposed_channel_config(
+    state: &AppState,
+    headers: &HeaderMap,
+    channel: &str,
+) -> Result<Config, Box<axum::response::Response>> {
+    require_auth(state, headers).map_err(|e| Box::new(e.into_response()))?;
+
+    // Without pairing every request authenticates, so nothing would stand
+    // between an anonymous caller and actions visible to third parties.
+    if !state.pairing.require_pairing() {
+        return Err(Box::new(channel_send_error(
+            StatusCode::FORBIDDEN,
+            channel,
+            "acting through a channel requires [gateway] require_pairing = true".to_string(),
+        )));
+    }
+
+    let config = state.config.read().clone();
+    let configured = config
+        .channels_by_alias()
+        .into_iter()
+        .any(|info| format!("{}.{}", info.channel_type, info.alias) == channel);
+    if !configured {
+        return Err(Box::new(channel_send_error(
+            StatusCode::NOT_FOUND,
+            channel,
+            format!("unknown channel {channel} — use the composite name from GET /api/channels"),
+        )));
+    }
+    if !config.gateway.send_channels.iter().any(|c| c == channel) {
+        return Err(Box::new(channel_send_error(
+            StatusCode::FORBIDDEN,
+            channel,
+            format!("channel {channel} is not listed in [gateway] send_channels"),
+        )));
+    }
+    Ok(config)
+}
+
+/// The instance the daemon is running for `channel`. Room operations need the
+/// live session; unlike a send, there is no meaningful fallback to a freshly
+/// built instance.
+fn running_channel(
+    channel: &str,
+) -> Result<std::sync::Arc<dyn zeroclaw_api::channel::Channel>, Box<axum::response::Response>> {
+    zeroclaw_channels::orchestrator::live_channel_map()
+        .get(&channel.to_ascii_lowercase())
+        .cloned()
+        .ok_or_else(|| {
+            Box::new(channel_send_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                channel,
+                format!("channel {channel} is not running"),
+            ))
+        })
+}
+
+/// Body of `POST /api/channels/{channel}/rooms`.
+#[derive(Deserialize)]
+pub struct RoomCreateBody {
+    /// Group subject.
+    pub name: String,
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// Participants to add, in the channel's own addressing.
+    #[serde(default)]
+    pub invites: Vec<String>,
+}
+
+/// POST /api/channels/{channel}/rooms — create a group through a running
+/// channel, without an agent turn.
+///
+/// Gated like the send route (pairing, `[gateway] send_channels`). The channel
+/// applies its own policy on top: WhatsApp Web refuses unless
+/// `room_management = true` for the alias, and only adds participants with an
+/// explicit allowlist entry. Listing the channel and enabling
+/// `room_management` is the operator's approval for the calls this route
+/// makes.
+///
+/// `200` with `{channel, room, outcome: "created"}`, where `room` is the id to
+/// send to and invite into (a `…@g.us` JID on WhatsApp). `400` for a blank
+/// name, `503` when the channel is not running, `502` when the channel refuses
+/// or fails.
+pub async fn handle_api_channel_room_create(
+    State(state): State<AppState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RoomCreateBody>,
+) -> impl IntoResponse {
+    if let Err(response) = exposed_channel_config(&state, &headers, &channel) {
+        return *response;
+    }
+    let name = body.name.trim();
+    if name.is_empty() {
+        return channel_send_error(
+            StatusCode::BAD_REQUEST,
+            &channel,
+            "`name` must not be empty".to_string(),
+        );
+    }
+    let live = match running_channel(&channel) {
+        Ok(live) => live,
+        Err(response) => return *response,
+    };
+
+    let options = zeroclaw_api::channel::RoomCreationOptions {
+        name: Some(name.to_string()),
+        topic: body.topic.filter(|t| !t.trim().is_empty()),
+        invites: body.invites,
+        ..Default::default()
+    };
+    match live.create_room(&options).await {
+        Ok(room) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({"channel": channel, "room": room})),
+                "room created through channel by API"
+            );
+            Json(serde_json::json!({
+                "channel": channel,
+                "room": room,
+                "outcome": "created",
+            }))
+            .into_response()
+        }
+        Err(e) => channel_send_error(
+            StatusCode::BAD_GATEWAY,
+            &channel,
+            format!("channel did not create the room: {e}"),
+        ),
+    }
+}
+
+/// Body of `POST /api/channels/{channel}/rooms/{room}/invites`.
+#[derive(Deserialize)]
+pub struct RoomInviteBody {
+    /// Participant to add, in the channel's own addressing.
+    pub user: String,
+}
+
+/// POST /api/channels/{channel}/rooms/{room}/invites — add a participant to
+/// a group through a running channel. Gated and answered like room creation;
+/// `200` with `{channel, room, user, outcome: "invited"}`.
+pub async fn handle_api_channel_room_invite(
+    State(state): State<AppState>,
+    Path((channel, room)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<RoomInviteBody>,
+) -> impl IntoResponse {
+    if let Err(response) = exposed_channel_config(&state, &headers, &channel) {
+        return *response;
+    }
+    let user = body.user.trim();
+    if user.is_empty() || room.trim().is_empty() {
+        return channel_send_error(
+            StatusCode::BAD_REQUEST,
+            &channel,
+            "`user` and the room must not be empty".to_string(),
+        );
+    }
+    let live = match running_channel(&channel) {
+        Ok(live) => live,
+        Err(response) => return *response,
+    };
+
+    match live.invite_user(room.trim(), user).await {
+        Ok(()) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({"channel": channel, "room": room})),
+                "participant invited through channel by API"
+            );
+            Json(serde_json::json!({
+                "channel": channel,
+                "room": room.trim(),
+                "user": user,
+                "outcome": "invited",
+            }))
+            .into_response()
+        }
+        Err(e) => channel_send_error(
+            StatusCode::BAD_GATEWAY,
+            &channel,
+            format!("channel did not add the participant: {e}"),
+        ),
     }
 }
 
@@ -3371,7 +3537,20 @@ pub(crate) mod tests {
     /// or fails every send.
     struct RecordingChannel {
         sent: parking_lot::Mutex<Vec<zeroclaw_api::channel::SendMessage>>,
+        rooms: parking_lot::Mutex<Vec<(Option<String>, Vec<String>)>>,
+        invites: parking_lot::Mutex<Vec<(String, String)>>,
         fail: bool,
+    }
+
+    impl RecordingChannel {
+        fn new(fail: bool) -> Self {
+            Self {
+                sent: parking_lot::Mutex::new(Vec::new()),
+                rooms: parking_lot::Mutex::new(Vec::new()),
+                invites: parking_lot::Mutex::new(Vec::new()),
+                fail,
+            }
+        }
     }
 
     impl zeroclaw_api::attribution::Attributable for RecordingChannel {
@@ -3403,6 +3582,29 @@ pub(crate) mod tests {
             &self,
             _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
         ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn create_room(
+            &self,
+            options: &zeroclaw_api::channel::RoomCreationOptions,
+        ) -> anyhow::Result<String> {
+            if self.fail {
+                anyhow::bail!("room management is disabled for this channel");
+            }
+            self.rooms
+                .lock()
+                .push((options.name.clone(), options.invites.clone()));
+            Ok("120363000000000001@g.us".to_string())
+        }
+
+        async fn invite_user(&self, room_id: &str, user_id: &str) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("participant is not in this channel's allowlist");
+            }
+            self.invites
+                .lock()
+                .push((room_id.to_string(), user_id.to_string()));
             Ok(())
         }
     }
@@ -3458,10 +3660,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn api_channel_send_delivers_through_the_live_instance() {
         let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
-        let live = Arc::new(RecordingChannel {
-            sent: parking_lot::Mutex::new(Vec::new()),
-            fail: false,
-        });
+        let live = Arc::new(RecordingChannel::new(false));
         let _live = zeroclaw_channels::orchestrator::publish_live_channels_for_test(
             std::collections::HashMap::from([(
                 "telegram.default".to_string(),
@@ -3499,10 +3698,7 @@ pub(crate) mod tests {
         let _live = zeroclaw_channels::orchestrator::publish_live_channels_for_test(
             std::collections::HashMap::from([(
                 "telegram.default".to_string(),
-                Arc::new(RecordingChannel {
-                    sent: parking_lot::Mutex::new(Vec::new()),
-                    fail: true,
-                }) as Arc<dyn zeroclaw_api::channel::Channel>,
+                Arc::new(RecordingChannel::new(true)) as Arc<dyn zeroclaw_api::channel::Channel>,
             )]),
         );
 
@@ -3593,6 +3789,173 @@ pub(crate) mod tests {
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{content}");
         }
+    }
+
+    fn publish_recording(
+        live: &Arc<RecordingChannel>,
+    ) -> zeroclaw_channels::orchestrator::LiveChannelsTestGuard {
+        zeroclaw_channels::orchestrator::publish_live_channels_for_test(
+            std::collections::HashMap::from([(
+                "telegram.default".to_string(),
+                Arc::clone(live) as Arc<dyn zeroclaw_api::channel::Channel>,
+            )]),
+        )
+    }
+
+    fn room_body(name: &str, invites: &[&str]) -> RoomCreateBody {
+        RoomCreateBody {
+            name: name.to_string(),
+            topic: None,
+            invites: invites.iter().map(|i| (*i).to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_channel_room_create_creates_through_the_live_instance() {
+        let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
+        let live = Arc::new(RecordingChannel::new(false));
+        let _live = publish_recording(&live);
+
+        let response = handle_api_channel_room_create(
+            State(send_state(true)),
+            Path("telegram.default".to_string()),
+            bearer(),
+            Json(room_body(" Order follow-up ", &["15550001111"])),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["outcome"], "created");
+        assert_eq!(json["room"], "120363000000000001@g.us");
+        assert_eq!(
+            *live.rooms.lock(),
+            vec![(
+                Some("Order follow-up".to_string()),
+                vec!["15550001111".to_string()]
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_channel_room_invite_adds_through_the_live_instance() {
+        let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
+        let live = Arc::new(RecordingChannel::new(false));
+        let _live = publish_recording(&live);
+
+        let response = handle_api_channel_room_invite(
+            State(send_state(true)),
+            Path((
+                "telegram.default".to_string(),
+                "120363000000000001@g.us".to_string(),
+            )),
+            bearer(),
+            Json(RoomInviteBody {
+                user: "15550002222".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            *live.invites.lock(),
+            vec![(
+                "120363000000000001@g.us".to_string(),
+                "15550002222".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_channel_room_routes_report_a_channel_refusal_as_bad_gateway() {
+        let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
+        let live = Arc::new(RecordingChannel::new(true));
+        let _live = publish_recording(&live);
+
+        let create = handle_api_channel_room_create(
+            State(send_state(true)),
+            Path("telegram.default".to_string()),
+            bearer(),
+            Json(room_body("Order follow-up", &[])),
+        )
+        .await
+        .into_response();
+        assert_eq!(create.status(), StatusCode::BAD_GATEWAY);
+
+        let invite = handle_api_channel_room_invite(
+            State(send_state(true)),
+            Path((
+                "telegram.default".to_string(),
+                "120363000000000001@g.us".to_string(),
+            )),
+            bearer(),
+            Json(RoomInviteBody {
+                user: "15550002222".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(invite.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// Unlike a send, a room operation has no fallback to a freshly built
+    /// instance: without the running session there is nothing to act with.
+    #[tokio::test]
+    async fn api_channel_room_create_needs_the_channel_running() {
+        let _serialized = LIVE_CHANNELS_TEST_LOCK.lock().await;
+        let _live = zeroclaw_channels::orchestrator::publish_live_channels_for_test(
+            std::collections::HashMap::new(),
+        );
+
+        let response = handle_api_channel_room_create(
+            State(send_state(true)),
+            Path("telegram.default".to_string()),
+            bearer(),
+            Json(room_body("Order follow-up", &[])),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn api_channel_room_routes_share_the_send_gate() {
+        let unlisted = handle_api_channel_room_create(
+            State(send_state(false)),
+            Path("telegram.default".to_string()),
+            bearer(),
+            Json(room_body("Order follow-up", &[])),
+        )
+        .await
+        .into_response();
+        assert_eq!(unlisted.status(), StatusCode::FORBIDDEN);
+
+        let unauthenticated = handle_api_channel_room_invite(
+            State(send_state(true)),
+            Path((
+                "telegram.default".to_string(),
+                "120363000000000001@g.us".to_string(),
+            )),
+            HeaderMap::new(),
+            Json(RoomInviteBody {
+                user: "15550002222".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let blank = handle_api_channel_room_create(
+            State(send_state(true)),
+            Path("telegram.default".to_string()),
+            bearer(),
+            Json(room_body("   ", &[])),
+        )
+        .await
+        .into_response();
+        assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
     }
 
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {

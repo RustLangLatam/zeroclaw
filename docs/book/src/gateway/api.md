@@ -192,6 +192,27 @@ leak redaction.
 | `404` | No such channel is configured. |
 | `502` | The channel failed to deliver, for example because it is not running. |
 
+### Creating groups and adding participants
+
+Two more routes act through the same running channel, behind the same gate
+(pairing on, channel listed in `send_channels`):
+
+- `POST /api/channels/{channel}/rooms` with `{"name": "...", "topic": "...", "invites": ["15550001111"]}`
+  creates a group and answers `{channel, room, outcome: "created"}`. `room` is
+  the id to send to and invite into (a `...@g.us` JID on WhatsApp).
+- `POST /api/channels/{channel}/rooms/{room}/invites` with `{"user": "15550002222"}`
+  adds one participant and answers `{channel, room, user, outcome: "invited"}`.
+
+The channel applies its own policy on top. WhatsApp Web refuses unless
+`room_management = true` is set for the alias, and only adds participants that
+have an explicit allowlist entry (a `*` entry does not count). Listing the
+channel and enabling `room_management` is the operator's approval for these
+calls. To post in the new group, use the send route with the group id as `to`.
+
+These routes need the channel's live session, so they answer `503` when the
+channel is not running. A refusal or failure inside the channel answers `502`
+with the channel's error text.
+
 ## Stable error codes
 
 Errors return JSON with a stable `code` field plus a human-readable `message`.
