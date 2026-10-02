@@ -1844,20 +1844,23 @@ async fn authorize_on_channel(
                 ..Default::default()
             });
         let digits_of = |p: &str| p.chars().filter(char::is_ascii_digit).collect::<String>();
-        for peer in peers {
+        for peer in &peers {
             if !group
                 .external_peers
                 .iter()
-                .any(|known| digits_of(known.as_str()) == digits_of(&peer))
+                .any(|known| digits_of(known.as_str()) == digits_of(peer))
             {
                 group
                     .external_peers
-                    .push(zeroclaw_config::multi_agent::PeerUsername::new(peer));
+                    .push(zeroclaw_config::multi_agent::PeerUsername::new(
+                        peer.clone(),
+                    ));
                 changed = true;
             }
         }
     }
     if !changed {
+        grant_on_running_channel(channel, &peers, room);
         return Ok(());
     }
 
@@ -1871,7 +1874,18 @@ async fn authorize_on_channel(
         )));
     }
     *state.config.write() = working;
+    grant_on_running_channel(channel, &peers, room);
     Ok(())
+}
+
+/// The running channel reads its own config copy, not the gateway's; hand
+/// it the grant as well so it applies before the next restart.
+fn grant_on_running_channel(channel: &str, peers: &[String], room: Option<&str>) {
+    zeroclaw_channels::orchestrator::grant_channel_access(
+        channel,
+        peers,
+        room.map(str::to_string).as_slice(),
+    );
 }
 
 fn channel_send_error(
@@ -4184,6 +4198,14 @@ pub(crate) mod tests {
         );
         let on_disk = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(on_disk.contains("+15550001111") && on_disk.contains("120363000000000001@g.us"));
+        // The running channel holds its own config copy; it gets the grant too.
+        let live_grants = zeroclaw_channels::orchestrator::runtime_channel_grants("whatsapp.test");
+        assert!(live_grants.peers.contains(&"+15550001111".to_string()));
+        assert!(
+            live_grants
+                .groups
+                .contains(&"120363000000000001@g.us".to_string())
+        );
     }
 
     #[tokio::test]
@@ -4218,6 +4240,11 @@ pub(crate) mod tests {
             peers_of(&state),
             vec!["+15550002222"],
             "one entry per number"
+        );
+        assert!(
+            zeroclaw_channels::orchestrator::runtime_channel_grants("whatsapp.test")
+                .peers
+                .contains(&"+15550002222".to_string())
         );
         assert_eq!(live.invites.lock().len(), 3);
     }

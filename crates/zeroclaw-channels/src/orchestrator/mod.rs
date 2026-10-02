@@ -183,6 +183,50 @@ impl Drop for LiveChannelsTestGuard {
     }
 }
 
+/// Peers and groups authorized while the daemon runs, by composite
+/// `<type>.<alias>` channel name. The gateway's room routes write here and the
+/// WhatsApp channel's allowlist resolvers read it next to their config: the
+/// gateway and the channel supervisor each hold their own config copy, so a
+/// config write in the gateway alone would only reach the channel on restart.
+/// The gateway also saves the grant to disk, which is what survives a restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelGrants {
+    pub peers: Vec<String>,
+    pub groups: Vec<String>,
+}
+
+static RUNTIME_CHANNEL_GRANTS: std::sync::LazyLock<
+    std::sync::RwLock<HashMap<String, ChannelGrants>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Authorize `peers` and `groups` on `channel` for the running process.
+pub fn grant_channel_access(channel: &str, peers: &[String], groups: &[String]) {
+    let mut grants = RUNTIME_CHANNEL_GRANTS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = grants.entry(channel.to_ascii_lowercase()).or_default();
+    for peer in peers {
+        if !entry.peers.contains(peer) {
+            entry.peers.push(peer.clone());
+        }
+    }
+    for group in groups {
+        if !entry.groups.contains(group) {
+            entry.groups.push(group.clone());
+        }
+    }
+}
+
+/// What [`grant_channel_access`] authorized on `channel` so far.
+pub fn runtime_channel_grants(channel: &str) -> ChannelGrants {
+    RUNTIME_CHANNEL_GRANTS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&channel.to_ascii_lowercase())
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Owns one published registry generation for the lifetime of its channel task.
 /// A stale task must not clear a newer task's replacement when it finally exits.
 struct CronChannelRegistryLease {
@@ -12922,7 +12966,11 @@ fn build_channel_by_id(
                 let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                     let cfg_arc = config_arc.clone();
                     let alias = alias.clone();
-                    Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
+                    Arc::new(move || {
+                        let mut peers = cfg_arc.read().channel_external_peers("whatsapp", &alias);
+                        peers.extend(runtime_channel_grants(&format!("whatsapp.{alias}")).peers);
+                        peers
+                    })
                 };
                 let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                     let cfg_arc = config_arc.clone();
@@ -12935,6 +12983,9 @@ fn build_channel_by_id(
                             .get(&alias)
                             .map(|wa| wa.allowed_groups.clone())
                             .unwrap_or_default()
+                            .into_iter()
+                            .chain(runtime_channel_grants(&format!("whatsapp.{alias}")).groups)
+                            .collect()
                     })
                 };
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
@@ -14622,7 +14673,13 @@ fn collect_configured_channels_with_authority(
                     let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                         let cfg_arc = config_arc.clone();
                         let alias = alias.clone();
-                        Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
+                        Arc::new(move || {
+                            let mut peers =
+                                cfg_arc.read().channel_external_peers("whatsapp", &alias);
+                            peers
+                                .extend(runtime_channel_grants(&format!("whatsapp.{alias}")).peers);
+                            peers
+                        })
                     };
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
@@ -14678,7 +14735,13 @@ fn collect_configured_channels_with_authority(
                     let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                         let cfg_arc = config_arc.clone();
                         let alias = alias.clone();
-                        Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
+                        Arc::new(move || {
+                            let mut peers =
+                                cfg_arc.read().channel_external_peers("whatsapp", &alias);
+                            peers
+                                .extend(runtime_channel_grants(&format!("whatsapp.{alias}")).peers);
+                            peers
+                        })
                     };
                     let workspace_dir = config.channel_workspace_dir(&format!("whatsapp.{alias}"));
                     let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
@@ -14692,6 +14755,9 @@ fn collect_configured_channels_with_authority(
                                 .get(&alias)
                                 .map(|wa| wa.allowed_groups.clone())
                                 .unwrap_or_default()
+                                .into_iter()
+                                .chain(runtime_channel_grants(&format!("whatsapp.{alias}")).groups)
+                                .collect()
                         })
                     };
                     channels.push(ConfiguredChannel {
