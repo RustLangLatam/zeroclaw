@@ -200,8 +200,9 @@ second field.
 
 - A note longer than `transcription.max_duration_secs` is skipped, and so is
   one whose download or transcription fails, or whose transcript comes back
-  empty. The message then carries the ordinary media placeholder instead, and
-  the failure is logged.
+  empty. Such a note is dropped before it reaches the agent: audio has no media
+  placeholder, so the message is left empty and discarded, and the reason is
+  logged.
 - Only voice notes are read. Other audio, such as a forwarded clip or a music
   file, is ignored unless `transcription.transcribe_non_ptt_audio = true`.
 
@@ -213,9 +214,10 @@ so in the log.
 
 **A chat is answered by voice once a voice note from it has been transcribed.**
 Receiving the audio is not enough: a note that is skipped, that fails to
-download, or that comes back with an empty transcript leaves the chat as it
-was. A message that never reaches this point at all, because a policy dropped
-it or because it is passive group context, leaves it alone too. With
+download or transcribe, or that comes back with an empty transcript clears the
+chat's voice state, like any other message without a transcript. Only a
+message that never reaches this point, because a policy dropped it or because
+it is passive group context, leaves the state alone. With
 `transcribe_non_ptt_audio` on, other transcribed audio sets it as well.
 
 The state is per chat, not per sender, and the next processed message that is
@@ -227,13 +229,13 @@ When the reply is spoken, the chat gets **both**: the text as usual, and a
 voice note alongside it. The chat keeps a readable record, and nothing is only
 available as audio.
 
-Four things shape the voice note itself:
+Five things shape the voice note itself:
 
 - It is sent as a real voice note (`ptt`), Opus-encoded, not as an audio
   attachment, so it renders as the waveform bubble rather than a file card.
 - What is spoken is the last eligible reply the chat produced, after about ten
-  quiet seconds. The queue holds one reply per chat and each new one replaces
-  the last, so an answer that arrives in several parts is not read out in full:
+  quiet seconds. The queue holds one reply per chat and each new eligible one
+  replaces the last, so an answer that arrives in several parts is not read out in full:
   the part that was queued when the pause ran out is the part that is spoken.
   Nothing tells the channel that an answer is complete.
 - Typing does not call back a reply already queued. Clearing the chat's state
@@ -241,11 +243,15 @@ Four things shape the voice note itself:
   looks at that state again, and hands its reply to the synthesizer regardless.
   So a message typed during those ten seconds is answered in text, while the
   reply that was already waiting is still spoken.
-- Replies that do not read well aloud stay text-only: anything of 40 bytes or
-  fewer, or that begins with a URL, a JSON document, a bracketed marker or
-  `Error`, or that carries a code fence, tool-call markup or raw weather-tool
-  output. These are shapes, not settings; a reply is judged by what it looks
-  like.
+- A reply sent with `suppress_voice` is never queued, and it does not replace
+  the reply already waiting. The runtime marks its own notices this way, such
+  as the no-reply notice and error replies, so they always stay text, whatever
+  they look like.
+- Other replies that do not read well aloud stay text-only too: anything of 40
+  bytes or fewer, or that begins with a URL, a JSON document, a bracketed
+  marker or `Error`, or that carries a code fence, tool-call markup or raw
+  weather-tool output. These are shapes, not settings; such a reply is judged
+  by what it looks like.
 
 ### What does not apply here
 
