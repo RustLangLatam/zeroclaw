@@ -1076,6 +1076,7 @@ impl WhatsAppWebChannel {
         let conversation_scope = Self::group_context_scope(context.passive_group_context, is_group);
         let mut passive_context = false;
         let text_content = msg.text_content().unwrap_or("").trim().to_string();
+        let has_text = !text_content.is_empty();
         let mut content = Self::media_fallback_content(text_content, msg);
 
         ::zeroclaw_log::record!(
@@ -1199,9 +1200,9 @@ impl WhatsAppWebChannel {
         } else if let Ok(mut vs) = context.voice_chats.lock() {
             vs.remove(&reply_target);
         }
-        // A media-only message gets a placeholder here; a caption that happens
-        // to read "[Image]" is still the sender's text.
-        let content_is_placeholder = content.is_empty();
+        // A media-only message carries the channel's placeholder by now; a
+        // caption that happens to read "[Image]" is still the sender's text.
+        let content_is_placeholder = !has_text && voice_text.is_none();
         content = Self::media_fallback_content(content, msg);
 
         if content.is_empty() {
