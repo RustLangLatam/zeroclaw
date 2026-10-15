@@ -161,14 +161,8 @@ impl EmailChannel {
     /// `Auto-Submitted` other than `no`, `Precedence: bulk|list|junk`, or a
     /// mailing-list header. `None` for mail a person sent.
     fn automatic_mail_reason(parsed: &mail_parser::Message) -> Option<&'static str> {
-        let header = |name: &'static str| {
-            parsed
-                .header_raw(name)
-                .map(|value| value.trim().to_ascii_lowercase())
-        };
-        if header("Auto-Submitted")
-            .is_some_and(|v| v.split(';').next().unwrap_or("").trim() != "no")
-        {
+        let header = |name: &'static str| parsed.header_raw(name).map(header_keyword);
+        if header("Auto-Submitted").is_some_and(|v| v != "no") {
             return Some("auto_submitted");
         }
         if header("Precedence").is_some_and(|v| matches!(v.as_str(), "bulk" | "list" | "junk")) {
@@ -1028,6 +1022,33 @@ fn markdown_to_html(md: &str) -> String {
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
     html_output
+}
+
+/// The keyword of a structured header value, lowercased: RFC 822 comments
+/// (nested, with quoted pairs) and whitespace removed, parameters after the
+/// first `;` dropped. `"No (by hand) ; x=1"` gives `"no"`.
+fn header_keyword(value: &str) -> String {
+    let mut keyword = String::new();
+    let mut depth = 0u32;
+    let mut escaped = false;
+    for c in value.chars() {
+        if depth > 0 {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+        } else if c == '(' {
+            depth = 1;
+        } else if c == ';' {
+            break;
+        } else if !c.is_whitespace() {
+            keyword.push(c.to_ascii_lowercase());
+        }
+    }
+    keyword
 }
 
 fn smtp_credential_override(value: Option<&str>) -> Option<&str> {
@@ -1929,6 +1950,18 @@ mod tests {
         assert_eq!(reason("Precedence: Bulk\r\n"), Some("precedence"));
         assert_eq!(reason("Precedence: junk\r\n"), Some("precedence"));
         assert_eq!(reason("Precedence: first-class\r\n"), None);
+        assert_eq!(reason("Auto-Submitted: no (sent by a person)\r\n"), None);
+        assert_eq!(reason("Auto-Submitted: (a (nested) note) NO\r\n"), None);
+        assert_eq!(reason("Auto-Submitted: no (a \\) b)\r\n"), None);
+        assert_eq!(
+            reason("Auto-Submitted: auto-replied (vacation)\r\n"),
+            Some("auto_submitted")
+        );
+        assert_eq!(
+            reason("Precedence: bulk (newsletter)\r\n"),
+            Some("precedence")
+        );
+        assert_eq!(reason("Precedence: (x) List\r\n"), Some("precedence"));
         assert_eq!(
             reason("List-Id: <news.example.invalid>\r\n"),
             Some("mailing_list")
