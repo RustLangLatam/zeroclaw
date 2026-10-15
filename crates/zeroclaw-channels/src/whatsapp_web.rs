@@ -7340,8 +7340,10 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn voice_drop_notices_name_the_reason_without_internals() {
+        // Notices follow the process locale, so only check what every
+        // translation shares.
         let too_long = VoiceDropReason::TooLong { limit_secs: 900 }.notice();
-        assert!(too_long.contains("900s limit"), "{too_long}");
+        assert!(too_long.contains("900"), "{too_long}");
 
         let notices = [
             VoiceDropReason::NotConfigured,
@@ -7353,7 +7355,7 @@ mod tests {
         .map(VoiceDropReason::notice);
         for notice in &notices {
             assert!(
-                notice.starts_with("⚠️ Audio message skipped:"),
+                notice.starts_with("⚠️ "),
                 "every notice says what happened up front: {notice}"
             );
             assert!(
