@@ -1251,6 +1251,35 @@ mod tests {
         assert!(config.smtp_tls);
     }
 
+    /// How long a fake test server waits for the client, per accept and per
+    /// socket read or write, before it gives up so a regression fails the
+    /// test instead of hanging it.
+    const TEST_SERVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Accepts one client within [`TEST_SERVER_TIMEOUT`] and bounds its
+    /// reads and writes by the same timeout. Panics if no client connects.
+    fn accept_test_client(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + TEST_SERVER_TIMEOUT;
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the client never connected to the test server"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("test server accept failed: {e}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(TEST_SERVER_TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(TEST_SERVER_TIMEOUT)).unwrap();
+        stream
+    }
+
     /// Runs `Channel::send` against a one-shot plain-text SMTP server that
     /// offers STARTTLS but refuses it, and returns the send result and the
     /// commands the client sent.
@@ -1263,7 +1292,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let stream = accept_test_client(&listener);
             let mut writer = stream.try_clone().unwrap();
             let mut commands = Vec::new();
             writer.write_all(b"220 smtp.test ESMTP\r\n").unwrap();
