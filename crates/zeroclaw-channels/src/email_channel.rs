@@ -1289,11 +1289,18 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = zeroclaw_spawn::spawn!(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let Ok(mut tls) = acceptor.accept(tcp).await else {
+            // Bounded so a client that never connects or stalls the
+            // handshake fails the test instead of hanging it.
+            let handshake = timeout(Duration::from_secs(10), async {
+                let (tcp, _) = listener.accept().await.unwrap();
+                acceptor.accept(tcp).await
+            })
+            .await
+            .expect("the client never connected or finished the TLS handshake");
+            let Ok(mut tls) = handshake else {
                 return false;
             };
-            let _ = tls.write_all(greeting).await;
+            let _ = timeout(Duration::from_secs(5), tls.write_all(greeting)).await;
             let mut buf = [0_u8; 1024];
             let _ = timeout(Duration::from_secs(5), tls.read(&mut buf)).await;
             true
