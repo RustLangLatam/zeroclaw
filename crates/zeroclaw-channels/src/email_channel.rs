@@ -1003,8 +1003,11 @@ fn markdown_to_html(md: &str) -> String {
     html_output
 }
 
-/// Longest message-id or file-name fragment kept in a saved file's name.
-const SAVED_NAME_MAX_CHARS: usize = 100;
+/// Longest readable message-id prefix kept in a saved file's name.
+const SAVED_STEM_MAX_CHARS: usize = 40;
+
+/// Longest saved file name in bytes, the common filesystem limit.
+const SAVED_NAME_MAX_BYTES: usize = 255;
 
 /// Saves every attachment that is neither image nor audio as
 /// `<workspace>/email_files/<id>_<n>_<name>` and marks it as a document, so
@@ -1033,12 +1036,21 @@ async fn save_inbound_documents(
                     if !is_document(attachment) {
                         continue;
                     }
-                    let name = safe_file_name(&attachment.file_name);
-                    let path = save_dir.join(format!("{id}_{n}_{name}"));
-                    if let Err(e) = tokio::fs::write(&path, &attachment.data).await {
-                        warn_save_failed(&e, "failed to save email attachment");
-                        continue;
-                    }
+                    let prefix = format!("{id}_{n}");
+                    let (path, name) = match write_new_file(
+                        &save_dir,
+                        &prefix,
+                        &attachment.file_name,
+                        &attachment.data,
+                    )
+                    .await
+                    {
+                        Ok(saved) => saved,
+                        Err(e) => {
+                            warn_save_failed(&e, "failed to save email attachment");
+                            continue;
+                        }
+                    };
                     let target = path.display().to_string();
                     lines.push(format!("[Document: {name}] {target}"));
                     attachment.marker = Some(RenderedMarker {
@@ -1087,23 +1099,71 @@ fn warn_save_failed(error: &std::io::Error, what: &str) {
     );
 }
 
-/// A message id reduced to ASCII letters, digits, `-` and `_`, bounded.
+/// Writes `data` to a new file `<prefix>_<name>` in `dir`, never replacing an
+/// existing file: on a name clash it retries with `-1`, `-2`, ... appended to
+/// the prefix. The whole name fits in [`SAVED_NAME_MAX_BYTES`]. Returns the
+/// path and the sanitized attachment name.
+async fn write_new_file(
+    dir: &Path,
+    prefix: &str,
+    file_name: &str,
+    data: &[u8],
+) -> std::io::Result<(PathBuf, String)> {
+    use tokio::io::AsyncWriteExt;
+
+    for attempt in 0..100u32 {
+        let prefix = if attempt == 0 {
+            prefix.to_string()
+        } else {
+            format!("{prefix}-{attempt}")
+        };
+        let name = safe_file_name(file_name, SAVED_NAME_MAX_BYTES - prefix.len() - 1);
+        let path = dir.join(format!("{prefix}_{name}"));
+        let mut file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let written = async {
+            file.write_all(data).await?;
+            file.flush().await
+        }
+        .await;
+        if let Err(e) = written {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(e);
+        }
+        return Ok((path, name));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free file name for the email attachment",
+    ))
+}
+
+/// A message id reduced to a short ASCII prefix (letters, digits, `-`, `_`)
+/// plus a hash of the full id, so ids that sanitize alike stay apart.
 fn safe_file_stem(msg_id: &str) -> String {
-    let stem: String = msg_id
+    let prefix: String = msg_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        .take(SAVED_NAME_MAX_CHARS)
+        .take(SAVED_STEM_MAX_CHARS)
         .collect();
-    if stem.is_empty() {
-        "email".to_string()
-    } else {
-        stem
-    }
+    let prefix = if prefix.is_empty() { "email" } else { &prefix };
+    let digest = Sha256::digest(msg_id.as_bytes());
+    format!("{prefix}-{}", hex::encode(&digest[..8]))
 }
 
 /// A sender-supplied file name with no path separators, control characters
-/// or leading dots, bounded in length while keeping a short extension.
-fn safe_file_name(file_name: &str) -> String {
+/// or leading dots, at most `max_bytes` long without splitting a character,
+/// keeping a short extension when it has to be shortened.
+fn safe_file_name(file_name: &str, max_bytes: usize) -> String {
     let base = file_name.rsplit(['/', '\\']).next().unwrap_or_default();
     let cleaned: String = base
         .chars()
@@ -1113,18 +1173,20 @@ fn safe_file_name(file_name: &str) -> String {
     if cleaned.is_empty() {
         return "attachment".to_string();
     }
-    if cleaned.chars().count() <= SAVED_NAME_MAX_CHARS {
+    if cleaned.len() <= max_bytes {
         return cleaned.to_string();
     }
     let ext = Path::new(cleaned)
         .extension()
         .and_then(|e| e.to_str())
-        .filter(|e| e.len() <= 10)
+        .filter(|e| e.len() <= 10 && e.len() < max_bytes)
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
-    let keep = SAVED_NAME_MAX_CHARS - ext.chars().count();
-    let stem: String = cleaned.chars().take(keep).collect();
-    format!("{stem}{ext}")
+    let mut keep = max_bytes - ext.len();
+    while !cleaned.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}{ext}", &cleaned[..keep])
 }
 
 fn smtp_credential_override(value: Option<&str>) -> Option<&str> {
@@ -2056,8 +2118,10 @@ mod tests {
         let msg = dispatch_documents(Some(workspace.path())).await;
 
         let save_dir = std::fs::canonicalize(workspace.path().join("email_files")).unwrap();
-        let pdf = save_dir.join("doc-1exampleinvalid_0_report.pdf");
-        let csv = save_dir.join("doc-1exampleinvalid_1_rows.csv");
+        let stem = safe_file_stem("doc-1@example.invalid");
+        assert!(stem.starts_with("doc-1exampleinvalid-"));
+        let pdf = save_dir.join(format!("{stem}_0_report.pdf"));
+        let csv = save_dir.join(format!("{stem}_1_rows.csv"));
         assert_eq!(std::fs::read(&pdf).unwrap(), b"PDF_BINARY_DATA");
         // A text attachment is saved even though the email has a body.
         assert_eq!(std::fs::read(&csv).unwrap(), b"a,b");
@@ -2132,13 +2196,90 @@ mod tests {
 
     #[test]
     fn safe_file_name_strips_paths_and_leading_dots_and_bounds_length() {
-        assert_eq!(safe_file_name("../../etc/passwd"), "passwd");
-        assert_eq!(safe_file_name("C:\\x\\.hidden"), "hidden");
-        assert_eq!(safe_file_name("..."), "attachment");
+        assert_eq!(safe_file_name("../../etc/passwd", 255), "passwd");
+        assert_eq!(safe_file_name("C:\\x\\.hidden", 255), "hidden");
+        assert_eq!(safe_file_name("...", 255), "attachment");
         let long = format!("{}.xlsx", "a".repeat(300));
-        let safe = safe_file_name(&long);
-        assert_eq!(safe.chars().count(), SAVED_NAME_MAX_CHARS);
+        let safe = safe_file_name(&long, 100);
+        assert_eq!(safe.len(), 100);
         assert!(safe.ends_with(".xlsx"));
+    }
+
+    #[test]
+    fn safe_file_stem_keeps_similar_message_ids_apart() {
+        let a = safe_file_stem("doc.1@example.invalid");
+        let b = safe_file_stem("doc1@example.invalid");
+        assert_ne!(a, b);
+        assert!(a.starts_with("doc1exampleinvalid-"));
+        assert_eq!(a, safe_file_stem("doc.1@example.invalid"));
+        assert!(safe_file_stem(&"x".repeat(1000)).len() <= SAVED_STEM_MAX_CHARS + 17);
+    }
+
+    #[tokio::test]
+    async fn write_new_file_bounds_long_unicode_names_in_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = format!("{}_7", safe_file_stem(&"m".repeat(500)));
+        let long = format!("{}.pdf", "\u{65e5}".repeat(200));
+
+        let (path, name) = write_new_file(dir.path(), &prefix, &long, b"data")
+            .await
+            .unwrap();
+
+        let saved = path.file_name().unwrap().to_str().unwrap();
+        assert!(saved.len() <= SAVED_NAME_MAX_BYTES);
+        assert!(saved.len() > SAVED_NAME_MAX_BYTES - 3);
+        assert!(saved.ends_with(".pdf"));
+        assert!(name.starts_with('\u{65e5}'));
+        assert_eq!(std::fs::read(&path).unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn write_new_file_never_replaces_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = write_new_file(dir.path(), "id_0", "a.pdf", b"first")
+            .await
+            .unwrap();
+        let (second, name) = write_new_file(dir.path(), "id_0", "a.pdf", b"second")
+            .await
+            .unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(name, "a.pdf");
+        assert_eq!(second.file_name().unwrap(), "id_0-1_a.pdf");
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second");
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_keeps_attachments_of_similar_message_ids_apart() {
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            resolver_from(vec!["*".to_string()]),
+        )
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let (tx, mut rx) = mpsc::channel(2);
+        for (uid, id, body) in [(1, "doc.1", "FIRST"), (2, "doc1", "SECOND")] {
+            let raw = String::from_utf8(DOCUMENTS_EMAIL.to_vec())
+                .unwrap()
+                .replace("<doc-1@", &format!("<{id}@"))
+                .replace("PDF_BINARY_DATA", body);
+            let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
+            let email = channel.build_parsed_email(&parsed, uid, Some(1234));
+            channel.dispatch_email(email, &tx).await.unwrap();
+        }
+
+        for expected in [b"FIRST".as_slice(), b"SECOND".as_slice()] {
+            let msg = rx.recv().await.unwrap();
+            let pdf = msg
+                .attachments
+                .iter()
+                .find(|a| a.file_name.ends_with("report.pdf"))
+                .and_then(|a| a.marker.as_ref())
+                .unwrap();
+            assert_eq!(std::fs::read(&pdf.target).unwrap(), expected);
+        }
     }
 
     #[test]
